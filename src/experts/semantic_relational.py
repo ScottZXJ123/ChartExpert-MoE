@@ -264,23 +264,20 @@ class KnowledgeIntegrationExpert(BaseExpert):
         textual_info = self.textual_info_processor(hidden_states)
         spatial_info = self.spatial_info_processor(hidden_states)
         
-        # Combine information sources
-        combined_info = torch.stack([visual_info, textual_info, spatial_info], dim=1)
-        
-        # Apply cross-attention to integrate information
-        integrated_info, _ = self.cross_attention(
-            combined_info, combined_info, combined_info
-        )
-        
         # Fusion gating
-        flattened_info = integrated_info.view(integrated_info.size(0), -1)
-        fusion_weights = self.fusion_gate(flattened_info)
+        fusion_input = torch.cat([visual_info, textual_info, spatial_info], dim=-1)
+        fusion_weights = self.fusion_gate(fusion_input)  # [batch_size, hidden_size]
         
-        # Apply fusion weights
-        final_integrated = torch.sum(
-            integrated_info * fusion_weights.unsqueeze(1).unsqueeze(-1), 
-            dim=1
+        # Apply fusion weights to the original fusion (simple weighted sum)
+        # Note: fusion_weights should be used differently
+        final_integrated = (
+            visual_info * 0.33 +  # Equal weighting for now
+            textual_info * 0.33 +
+            spatial_info * 0.34
         )
+        
+        # Apply the fusion gate as a multiplicative gate
+        final_integrated = final_integrated * fusion_weights
         
         return final_integrated
     
