@@ -1,25 +1,114 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
-Demo script for ChartExpert-MoE
+ChartExpert-MoE Demo Script
 
-This script demonstrates how to use the ChartExpert-MoE model for chart reasoning
-and provides examples of different types of chart questions.
+This script demonstrates the capabilities of ChartExpert-MoE on chart reasoning tasks.
+It can work with mock data for testing or real chart images when available.
 """
 
+import argparse
+import torch
+import yaml
+from PIL import Image
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import Dict, Any
 import os
 import sys
-import argparse
-import yaml
-import torch
-from PIL import Image
-import matplotlib.pyplot as plt
 
 # Add src to path
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import ChartExpertMoE
-from data import ChartMuseumDataset
-from transformers import AutoTokenizer
+from src.models import ChartExpertMoE
+from src.utils import load_config, setup_logging
+
+
+def create_mock_model(config: Dict[str, Any]) -> ChartExpertMoE:
+    """Create a mock model for demonstration"""
+    # For demo purposes, we'll create a smaller config
+    demo_config = {
+        "hidden_size": 768,
+        "vocab_size": 32000,
+        "vision_encoder": {
+            "type": "clip",
+            "model_name": "openai/clip-vit-base-patch32",
+            "hidden_size": 768
+        },
+        "llm_backbone": {
+            "type": "llama",
+            "model_name": "meta-llama/Llama-2-7b-hf",
+            "hidden_size": 4096
+        },
+        "experts": config["experts"],
+        "routing": config["routing"],
+        "moe": config["moe"],
+        "fusion": config["fusion"]
+    }
+    
+    # Create model
+    model = ChartExpertMoE(demo_config)
+    return model
+
+
+def create_mock_chart_image() -> Image.Image:
+    """Create a mock chart image for demonstration"""
+    fig, ax = plt.subplots(figsize=(8, 6))
+    
+    # Create sample data
+    categories = ['Q1', 'Q2', 'Q3', 'Q4']
+    values_2022 = [45, 52, 48, 58]
+    values_2023 = [50, 55, 53, 62]
+    
+    x = np.arange(len(categories))
+    width = 0.35
+    
+    # Create bars
+    bars1 = ax.bar(x - width/2, values_2022, width, label='2022', color='skyblue')
+    bars2 = ax.bar(x + width/2, values_2023, width, label='2023', color='lightcoral')
+    
+    # Add labels and title
+    ax.set_xlabel('Quarter')
+    ax.set_ylabel('Sales (in millions)')
+    ax.set_title('Quarterly Sales Comparison 2022 vs 2023')
+    ax.set_xticks(x)
+    ax.set_xticklabels(categories)
+    ax.legend()
+    
+    # Add value labels on bars
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            ax.annotate(f'{height}',
+                       xy=(bar.get_x() + bar.get_width() / 2, height),
+                       xytext=(0, 3),
+                       textcoords="offset points",
+                       ha='center', va='bottom')
+    
+    plt.tight_layout()
+    
+    # Convert to PIL Image
+    fig.canvas.draw()
+    img = Image.frombytes('RGB', fig.canvas.get_width_height(), 
+                         fig.canvas.tostring_rgb())
+    plt.close()
+    
+    return img
+
+
+def analyze_expert_activations(routing_weights: torch.Tensor) -> Dict[str, float]:
+    """Analyze expert activation patterns"""
+    expert_names = [
+        "layout", "ocr", "scale", "geometric", "trend",
+        "query", "numerical", "integration", "alignment", "orchestrator"
+    ]
+    
+    # Average activation across sequence and batch
+    avg_activations = routing_weights.mean(dim=(0, 1)).cpu().numpy()
+    
+    return {
+        expert_names[i]: float(avg_activations[i])
+        for i in range(min(len(expert_names), len(avg_activations)))
+    }
 
 
 def parse_args():
@@ -74,46 +163,13 @@ def parse_args():
         help="Show expert activation analysis"
     )
     
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Use CPU instead of GPU"
+    )
+    
     return parser.parse_args()
-
-
-def analyze_expert_activations(expert_activations, threshold=0.1):
-    """Analyze and explain expert activations"""
-    print("\n" + "="*50)
-    print("EXPERT ACTIVATION ANALYSIS")
-    print("="*50)
-    
-    expert_descriptions = {
-        "layout": "Chart structure and element detection",
-        "ocr": "Text extraction and positioning",
-        "scale": "Axis scale and coordinate interpretation", 
-        "geometric": "Geometric property analysis (heights, areas, etc.)",
-        "trend": "Pattern and trend identification",
-        "query": "Question understanding and decomposition",
-        "numerical": "Mathematical reasoning and calculations",
-        "integration": "Information synthesis across chart elements",
-        "alignment": "Visual-textual correspondence",
-        "orchestrator": "Complex multi-step reasoning coordination"
-    }
-    
-    # Sort experts by activation strength
-    sorted_experts = sorted(expert_activations.items(), key=lambda x: x[1], reverse=True)
-    
-    print(f"Active Experts (threshold: {threshold}):")
-    print("-" * 50)
-    
-    for expert, activation in sorted_experts:
-        if activation > threshold:
-            status = "🔥 HIGHLY ACTIVE" if activation > 0.5 else "✅ ACTIVE"
-            description = expert_descriptions.get(expert, "Unknown expert")
-            print(f"{status:15} {expert:12} ({activation:.3f}) - {description}")
-    
-    print("\nInactive Experts:")
-    print("-" * 20)
-    for expert, activation in sorted_experts:
-        if activation <= threshold:
-            description = expert_descriptions.get(expert, "Unknown expert")
-            print(f"💤 {expert:12} ({activation:.3f}) - {description}")
 
 
 def explain_reasoning_process(expert_activations, question, response):
@@ -160,143 +216,149 @@ def explain_reasoning_process(expert_activations, question, response):
     print(f"\n📄 Generated Response: {response}")
 
 
-def run_interactive_demo():
-    """Run interactive demo with sample questions"""
-    sample_questions = [
-        "What is the highest value in the chart?",
-        "Which category has the lowest value?", 
-        "What is the trend shown in this data?",
-        "Compare the values between the first and last data points.",
-        "How many data points are there in total?",
-        "What is the difference between the maximum and minimum values?",
-        "Describe the overall pattern in this chart.",
-        "What can you conclude from this visualization?"
+def run_mock_demo(model: ChartExpertMoE, device: torch.device):
+    """Run demo with mock data"""
+    print("\n" + "="*60)
+    print("ChartExpert-MoE Demo - Mock Mode")
+    print("="*60)
+    
+    # Create mock chart
+    chart_image = create_mock_chart_image()
+    print("\n✅ Created mock chart image (Quarterly Sales Comparison)")
+    
+    # Save mock chart for reference
+    chart_path = "demo_chart.png"
+    chart_image.save(chart_path)
+    print(f"✅ Saved chart to {chart_path}")
+    
+    # Sample questions
+    questions = [
+        "What is the sales value for Q4 2023?",
+        "Which quarter had the highest sales in 2022?",
+        "What is the trend in sales from Q1 to Q4 in 2023?",
+        "Compare the sales growth between 2022 and 2023"
     ]
     
     print("\n" + "="*60)
-    print("CHARTEXPERT-MOE INTERACTIVE DEMO")
+    print("Running inference on sample questions...")
     print("="*60)
-    print("Sample questions you can try:")
     
-    for i, question in enumerate(sample_questions, 1):
-        print(f"{i}. {question}")
+    for i, question in enumerate(questions, 1):
+        print(f"\n📊 Question {i}: {question}")
+        print("-" * 60)
+        
+        # Mock inference (in practice, would use actual model)
+        with torch.no_grad():
+            # Create mock inputs
+            batch_size = 1
+            image_tensor = torch.randn(batch_size, 3, 224, 224).to(device)
+            input_ids = torch.randint(0, 1000, (batch_size, 50)).to(device)
+            attention_mask = torch.ones(batch_size, 50).to(device)
+            
+            # Run model
+            outputs = model(
+                image=image_tensor,
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
+            
+            # Get routing weights for expert analysis
+            routing_weights = outputs.get("routing_weights", torch.randn(batch_size, 50, 10).to(device))
+            
+            # Analyze expert activations
+            expert_activations = analyze_expert_activations(routing_weights)
+            
+            # Mock response based on question
+            if "Q4 2023" in question:
+                response = "The sales value for Q4 2023 is 62 million."
+            elif "highest sales in 2022" in question:
+                response = "Q4 had the highest sales in 2022 with 58 million."
+            elif "trend" in question:
+                response = "Sales show an upward trend from Q1 (50M) to Q4 (62M) in 2023, with steady growth each quarter."
+            else:
+                response = "2023 shows consistent growth compared to 2022, with an average increase of ~5M per quarter."
+            
+            print(f"🤖 Response: {response}")
+            
+            # Show expert activations
+            print("\n📊 Expert Activation Analysis:")
+            sorted_experts = sorted(expert_activations.items(), key=lambda x: x[1], reverse=True)
+            for expert, activation in sorted_experts[:5]:  # Top 5
+                bar = "█" * int(activation * 20)
+                print(f"  {expert:12} {bar} {activation:.3f}")
     
-    print("\nOr enter your own custom question!")
-    print("Type 'quit' to exit.")
-    print("-" * 60)
+    print("\n" + "="*60)
+    print("Demo completed! Check 'demo_chart.png' for the generated chart.")
+    print("="*60)
 
 
 def main():
-    """Main demo function"""
     args = parse_args()
     
-    print("🚀 Loading ChartExpert-MoE...")
+    # Setup logging
+    logger = setup_logging()
     
-    # Load model configuration
-    if args.config_path:
-        config_path = args.config_path
+    # Load config
+    config = load_config(args.config)
+    
+    # Device
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    print(f"Using device: {device}")
+    
+    # Create or load model
+    print("Loading ChartExpert-MoE model...")
+    
+    if args.model_path and os.path.exists(args.model_path):
+        # Load pretrained model
+        model = ChartExpertMoE.from_pretrained(args.model_path)
+        print(f"✅ Loaded model from {args.model_path}")
     else:
-        config_path = os.path.join(args.model_path, "config.yaml")
+        # Create mock model for demo
+        model = create_mock_model(config)
+        print("✅ Created mock model for demonstration")
     
-    if os.path.exists(config_path):
-        with open(config_path, 'r') as f:
-            config = yaml.safe_load(f)
-    else:
-        print(f"⚠️ Config file not found at {config_path}, using defaults")
-        config = {"llm_backbone": {"model_name": "meta-llama/Llama-2-7b-hf"}}
-    
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        config["llm_backbone"]["model_name"]
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    
-    # Load model
-    try:
-        model = ChartExpertMoE.from_pretrained(args.model_path, args.config_path)
-        print("✅ Model loaded successfully!")
-    except Exception as e:
-        print(f"❌ Error loading model: {e}")
-        print("Using randomly initialized model for demonstration...")
-        model = ChartExpertMoE(config)
-    
-    # Set to evaluation mode
+    model = model.to(device)
     model.eval()
     
-    # Check if image exists
-    if not os.path.exists(args.image_path):
-        print(f"❌ Image not found: {args.image_path}")
-        return
-    
-    # Display the chart image
-    print(f"\n📊 Analyzing chart: {args.image_path}")
-    
-    try:
-        # Load and display image
-        image = Image.open(args.image_path)
-        plt.figure(figsize=(10, 6))
-        plt.imshow(image)
-        plt.axis('off')
-        plt.title("Chart to Analyze")
-        plt.tight_layout()
-        plt.show()
-    except Exception as e:
-        print(f"⚠️ Could not display image: {e}")
-    
-    # Run inference
-    print(f"\n🤔 Question: {args.question}")
-    print("🧠 Processing with ChartExpert-MoE...")
-    
-    try:
-        with torch.no_grad():
+    # Run demo based on mode
+    if args.image_path and os.path.exists(args.image_path):
+        # Run with actual image
+        print(f"\nProcessing chart image: {args.image_path}")
+        
+        image = Image.open(args.image_path).convert("RGB")
+        
+        if args.question:
+            # Single question mode
             result = model.predict(
                 image_path=args.image_path,
-                query=args.question,
-                max_length=args.max_length,
-                temperature=args.temperature
+                query=args.question
             )
-        
-        response = result["response"]
-        expert_activations = result["expert_activations"]
-        confidence = result["confidence"]
-        
-        print("\n" + "="*50)
-        print("CHARTEXPERT-MOE RESPONSE")
-        print("="*50)
-        print(f"💬 Answer: {response}")
-        print(f"🎯 Confidence: {confidence:.3f}")
-        
-        if args.show_expert_analysis:
-            analyze_expert_activations(expert_activations)
-            explain_reasoning_process(expert_activations, args.question, response)
-        
-    except Exception as e:
-        print(f"❌ Error during inference: {e}")
-        print("This might be due to missing model weights or configuration issues.")
-    
-    # Show sample questions for future use
-    print("\n" + "="*50)
-    print("TRY MORE QUESTIONS")
-    print("="*50)
-    print("Here are some sample questions you can try with different charts:")
-    
-    sample_questions = [
-        "What is the trend in the data over time?",
-        "Which category has the highest value?",
-        "What is the relationship between X and Y variables?", 
-        "How much did the value change between 2020 and 2021?",
-        "What percentage of the total does each segment represent?",
-        "Are there any outliers in the data?",
-        "What pattern can you observe in this chart?",
-        "What conclusions can be drawn from this visualization?"
-    ]
-    
-    for i, question in enumerate(sample_questions, 1):
-        print(f"{i}. {question}")
-    
-    print(f"\nTo try another question, run:")
-    print(f"python {sys.argv[0]} --model_path {args.model_path} --image_path <new_image> --question '<new_question>'")
+            
+            print(f"\n📊 Question: {args.question}")
+            print(f"🤖 Response: {result['response']}")
+            
+            if args.show_expert_analysis:
+                print("\n📊 Expert Activation Analysis:")
+                for expert, activation in result['expert_activations'].items():
+                    bar = "█" * int(activation * 20)
+                    print(f"  {expert:12} {bar} {activation:.3f}")
+        else:
+            # Interactive mode
+            print("\nEntering interactive mode. Type 'quit' to exit.")
+            while True:
+                question = input("\n❓ Enter your question: ")
+                if question.lower() == 'quit':
+                    break
+                
+                result = model.predict(
+                    image_path=args.image_path,
+                    query=question
+                )
+                
+                print(f"🤖 Response: {result['response']}")
+    else:
+        # Run mock demo
+        run_mock_demo(model, device)
 
 
 if __name__ == "__main__":

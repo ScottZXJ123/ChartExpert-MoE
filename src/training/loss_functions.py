@@ -7,7 +7,7 @@ Implements specialized loss functions for MoE training including auxiliary losse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 
 
 class ChartMoELoss(nn.Module):
