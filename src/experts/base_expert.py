@@ -32,10 +32,8 @@ class BaseExpert(nn.Module, ABC):
         self.expert_layers = self._build_expert_layers(config)
         
         # Output projection to ensure consistent output size
-        self.output_projection = nn.Linear(
-            config.get("expert_hidden_size", self.hidden_size),
-            self.hidden_size
-        )
+        expert_output_size = config.get("expert_hidden_size", self.hidden_size)
+        self.output_projection = nn.Linear(self.hidden_size, self.hidden_size)
         
         # Activation tracking for analysis
         self.activation_count = 0
