@@ -15,8 +15,10 @@ from tqdm import tqdm
 import logging
 import os
 from collections import defaultdict
+import torch.optim as optim
+from transformers import get_scheduler
 
-from ..models import ChartExpertMoE
+from models import ChartExpertMoE
 from .loss_functions import ChartMoELoss
 
 
@@ -212,20 +214,14 @@ class MultiStageTrainer(Trainer):
         self.logger.info(f"Starting training stage: {stage}")
         
         # Create optimizer and scheduler for this stage
-        from .optimizer_utils import create_optimizer, create_scheduler
-        optimizer = create_optimizer(
-            self.model, 
-            stage_config["learning_rate"],
-            self.config.get("optimizer", "adamw"),
-            self.config.get("weight_decay", 0.01)
-        )
+        optimizer = optim.AdamW(self.model.parameters(), lr=stage_config["learning_rate"], weight_decay=stage_config.get("weight_decay", 0.01))
         
         total_steps = len(train_loader) * stage_config["epochs"]
-        scheduler = create_scheduler(
-            optimizer,
-            self.config.get("scheduler", "cosine"),
-            total_steps,
-            stage_config.get("warmup_steps", 0)
+        scheduler = get_scheduler(
+            name=stage_config.get("scheduler", "cosine_with_restarts"),
+            optimizer=optimizer,
+            num_warmup_steps=stage_config.get("warmup_steps", int(0.1 * total_steps)),
+            num_training_steps=total_steps
         )
         
         # Stage-specific training
@@ -292,3 +288,224 @@ class MultiStageTrainer(Trainer):
         elif stage == "chartmuseum_finetune":
             # Fine-tune everything with small learning rate
             pass 
+
+    def train_stage(self, stage_name: str, train_loader: DataLoader, val_loader: Optional[DataLoader], stage_config: Dict[str, Any]):
+        """
+        Trains the model for a specific stage.
+        """
+        self.logger.info(f"Initializing training for stage: {stage_name}")
+        
+        # Optimizer
+        optimizer_config = stage_config.get("optimizer", {})
+        learning_rate = optimizer_config.get("lr", 1e-4)
+        weight_decay = optimizer_config.get("weight_decay", 0.01)
+        
+        # Filter out parameters that don't require gradients
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        if not trainable_params:
+            self.logger.warning(f"No trainable parameters found for stage {stage_name}. Skipping optimizer setup.")
+            # Potentially skip the stage or just run evaluation if val_loader is present
+            if val_loader and self.local_rank in [-1, 0]:
+                self._evaluate_stage(stage_name, val_loader, stage_config)
+            return
+
+        optimizer = optim.AdamW(trainable_params, lr=learning_rate, weight_decay=weight_decay)
+
+        # Scheduler
+        scheduler_config = stage_config.get("scheduler", {})
+        num_epochs = stage_config.get("num_epochs", 3)
+        
+        # Calculate total training steps based on actual loader size
+        # Handle cases where train_loader might be a DistributedSampler wrapped loader
+        try:
+            num_training_steps_per_epoch = len(train_loader)
+        except TypeError: # Happens if train_loader doesn't have a __len__ (e.g. IterableDataset)
+            # Estimate steps if loader length is not available, or require it in config
+            num_training_steps_per_epoch = stage_config.get("steps_per_epoch_estimate", 1000) 
+            self.logger.warning(f"Length of train_loader for stage {stage_name} not available. Using estimate: {num_training_steps_per_epoch} steps/epoch.")
+
+        num_training_steps = num_epochs * num_training_steps_per_epoch
+        
+        # Default warmup to 10% of total steps if not specified or if set to a fraction
+        warmup_setting = scheduler_config.get("warmup", 0.1)
+        if isinstance(warmup_setting, float) and 0 <= warmup_setting <= 1:
+            num_warmup_steps = int(warmup_setting * num_training_steps)
+        elif isinstance(warmup_setting, int):
+            num_warmup_steps = warmup_setting
+        else: # Default to 0 if invalid
+            num_warmup_steps = 0
+            
+        scheduler_type = scheduler_config.get("type", "cosine_with_restarts")
+        
+        # Handle case where num_training_steps might be 0 (e.g. empty dataloader)
+        if num_training_steps == 0 :
+            self.logger.warning(f"Number of training steps is 0 for stage {stage_name}. Skipping scheduler setup and training loop.")
+            # Potentially run evaluation
+            if val_loader and self.local_rank in [-1, 0]:
+                self._evaluate_stage(stage_name, val_loader, stage_config)
+            return
+
+        scheduler = get_scheduler(
+            name=scheduler_type,
+            optimizer=optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps
+        )
+        
+        start_epoch = 0
+        # TODO: Add logic for resuming from a stage-specific checkpoint (load optimizer, scheduler states)
+
+        self.logger.info(f"  Optimizer: AdamW, LR: {learning_rate}, Weight Decay: {weight_decay}")
+        self.logger.info(f"  Scheduler: {scheduler_type}, Warmup Steps: {num_warmup_steps}, Total Training Steps: {num_training_steps}")
+        self.logger.info(f"  Num Epochs: {num_epochs}, Steps per Epoch: {num_training_steps_per_epoch}")
+
+        best_val_metric = float('inf') # Lower is better for loss
+
+        for epoch in range(start_epoch, num_epochs):
+            self.logger.info(f"--- Stage {stage_name}, Epoch {epoch+1}/{num_epochs} ---")
+            self.model.train()
+            total_train_loss = 0.0
+            
+            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1} Training", disable=(self.local_rank not in [-1, 0]))
+            
+            for batch_idx, batch in enumerate(progress_bar):
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                
+                optimizer.zero_grad()
+                
+                outputs = self.model(**batch)
+                loss = outputs.get("loss")
+                
+                if loss is None:
+                    self.logger.error(f"Loss not found in model outputs for stage {stage_name}. Skipping batch.")
+                    continue
+
+                if torch.isnan(loss) or torch.isinf(loss):
+                    self.logger.warning(f"NaN or Inf loss detected at batch {batch_idx} in stage {stage_name}. Skipping batch.")
+                    continue
+
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(trainable_params, stage_config.get("max_grad_norm", 1.0))
+                optimizer.step()
+                scheduler.step()
+                
+                total_train_loss += loss.item()
+                
+                if self.local_rank in [-1, 0] and batch_idx % stage_config.get("log_interval", 10) == 0:
+                    current_lr = scheduler.get_last_lr()[0]
+                    log_data = {
+                        f"train/{stage_name}/loss_step": loss.item(),
+                        f"train/{stage_name}/lr": current_lr,
+                        f"train/{stage_name}/epoch_progress": epoch + (batch_idx / num_training_steps_per_epoch)
+                    }
+                    if "aux_loss" in outputs and outputs["aux_loss"] is not None:
+                         log_data[f"train/{stage_name}/aux_loss_step"] = outputs["aux_loss"].item()
+                    if wandb.run:
+                        wandb.log(log_data)
+                    progress_bar.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{current_lr:.2e}"})
+
+            avg_train_loss = total_train_loss / num_training_steps_per_epoch if num_training_steps_per_epoch > 0 else 0.0
+            self.logger.info(f"Epoch {epoch+1} Average Training Loss: {avg_train_loss:.4f}")
+            if self.local_rank in [-1, 0] and wandb.run:
+                 wandb.log({f"train/{stage_name}/loss_epoch": avg_train_loss, "epoch": epoch + 1, f"epoch_{stage_name}": epoch + 1})
+
+            if val_loader and self.local_rank in [-1, 0]:
+                val_metrics = self._evaluate_stage(stage_name, val_loader, stage_config)
+                # Default to monitor validation loss, assuming lower is better.
+                metric_to_monitor = stage_config.get("eval_metric_to_monitor", f"val/{stage_name}/loss")
+                current_val_metric = val_metrics.get(metric_to_monitor, float('inf'))
+
+                if wandb.run:
+                    wandb.log({**val_metrics, "epoch": epoch + 1, f"epoch_{stage_name}": epoch + 1})
+                
+                save_checkpoint_flag = False
+                is_current_best = False
+                if stage_config.get("save_best_checkpoint", True):
+                    # Assuming lower is better for the monitored metric (e.g., loss)
+                    if current_val_metric < best_val_metric:
+                        best_val_metric = current_val_metric
+                        save_checkpoint_flag = True
+                        is_current_best = True
+                        self.logger.info(f"New best validation metric ({metric_to_monitor}): {best_val_metric:.4f}. Saving model...")
+                elif stage_config.get("save_every_epoch", False): # Option to save every epoch if not just best
+                    save_checkpoint_flag = True
+                
+                if save_checkpoint_flag:
+                    self._save_checkpoint(stage_name, epoch, optimizer, scheduler, is_best=is_current_best)
+            elif self.local_rank in [-1, 0] and stage_config.get("save_every_epoch", True): # No val_loader, but save_every_epoch is true
+                 self._save_checkpoint(stage_name, epoch, optimizer, scheduler, is_best=False)
+
+        self.logger.info(f"Finished training stage: {stage_name}")
+
+    def _evaluate_stage(self, stage_name: str, val_loader: DataLoader, stage_config: Dict[str, Any]) -> Dict[str, float]:
+        self.model.eval()
+        total_val_loss = 0.0
+        # TODO: Initialize accumulators for other metrics
+        
+        self.logger.info(f"Starting validation for stage: {stage_name}...")
+        progress_bar = tqdm(val_loader, desc=f"Stage {stage_name} Validation", disable=(self.local_rank not in [-1, 0]))
+
+        with torch.no_grad():
+            for batch in progress_bar:
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                outputs = self.model(**batch)
+                loss = outputs.get("loss")
+                if loss is not None:
+                    total_val_loss += loss.item()
+                # TODO: Calculate and accumulate other eval metrics based on model output and batch
+                # e.g., accuracy, F1, perplexity. This might require an Evaluator class.
+
+        avg_val_loss = total_val_loss / len(val_loader) if len(val_loader) > 0 else 0.0
+        self.logger.info(f"Stage {stage_name} Validation Loss: {avg_val_loss:.4f}")
+        
+        metrics = {
+            f"val/{stage_name}/loss": avg_val_loss,
+            # TODO: Add other computed metrics here
+            # metrics[f"val/{stage_name}/accuracy"] = computed_accuracy
+        }
+        return metrics
+
+    def _save_checkpoint(self, stage_name: str, epoch: int, optimizer, scheduler, is_best: bool = False):
+        if self.local_rank not in [-1, 0]:
+            return
+
+        model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
+        
+        checkpoint_data = {
+            'epoch': epoch + 1,
+            'model_state_dict': model_to_save.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'config': self.config,
+            'stage_name': stage_name,
+            'tokenizer_name_or_path': self.tokenizer.name_or_path if hasattr(self.tokenizer, 'name_or_path') else None
+        }
+        
+        # Stage-specific save directory
+        stage_save_dir = os.path.join(self.output_dir, stage_name)
+        os.makedirs(stage_save_dir, exist_ok=True)
+        
+        filename_prefix = f"checkpoint_stage_{stage_name}"
+        epoch_filename = f"{filename_prefix}_epoch_{epoch+1}.pt"
+        full_epoch_save_path = os.path.join(stage_save_dir, epoch_filename)
+
+        # Save epoch checkpoint
+        torch.save(checkpoint_data, full_epoch_save_path)
+        self.logger.info(f"Saved epoch checkpoint to {full_epoch_save_path}")
+
+        if is_best:
+            best_filename = f"{filename_prefix}_best.pt"
+            full_best_save_path = os.path.join(stage_save_dir, best_filename)
+            torch.save(checkpoint_data, full_best_save_path) # Could also symlink
+            self.logger.info(f"Saved best checkpoint to {full_best_save_path}")
+        
+        # Save tokenizer (can be large if it's a custom/modified one, often not needed if using from_pretrained name)
+        # self.tokenizer.save_pretrained(os.path.join(stage_save_dir, f"tokenizer_epoch_{epoch+1}"))
+        # if is_best:
+        #     self.tokenizer.save_pretrained(os.path.join(stage_save_dir, "tokenizer_best"))
+
+# It's good practice to have an __all__ in __init__.py if you have one.
+# If src/training/__init__.py doesn't exist, it should be created.
+# Content for src/training/__init__.py:
+# from .trainer import MultiStageTrainer
+# __all__ = ["MultiStageTrainer"] 

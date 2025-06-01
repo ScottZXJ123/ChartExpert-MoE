@@ -14,83 +14,92 @@ class ChartMoELoss(nn.Module):
     """
     Combined loss function for ChartExpert-MoE training
     
-    Includes:
-    - Language modeling loss
-    - Auxiliary MoE losses (load balancing, router entropy)
-    - Optional task-specific losses
+    Combines:
+    - Language modeling loss (for text generation)
+    - Auxiliary load balancing loss (for MoE routing)
     """
     
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
         self.config = config
         self.aux_loss_weight = config.get("aux_loss_weight", 0.01)
-        self.label_smoothing = config.get("label_smoothing", 0.0)
         
-        # Language modeling loss
-        self.lm_loss = nn.CrossEntropyLoss(
-            ignore_index=-100,
-            label_smoothing=self.label_smoothing
-        )
-        
-        # Auxiliary losses
-        self.load_balance_loss = LoadBalanceLoss()
-        self.router_entropy_loss = RouterEntropyLoss()
-        
+        # Cross entropy loss for language modeling
+        self.lm_criterion = nn.CrossEntropyLoss(ignore_index=-100)
+    
     def forward(
         self,
         logits: torch.Tensor,
         labels: torch.Tensor,
-        routing_weights: Optional[torch.Tensor] = None,
         aux_loss: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
-        Calculate combined loss
+        Compute combined loss
         
         Args:
-            logits: Model output logits [batch_size, seq_len, vocab_size]
-            labels: Target labels [batch_size, seq_len]
-            routing_weights: Expert routing weights [batch_size, seq_len, num_experts]
-            aux_loss: Pre-computed auxiliary loss from MoE layer
+            logits: Language model logits [batch_size, seq_len, vocab_size]
+            labels: Target token ids [batch_size, seq_len]
+            aux_loss: Auxiliary MoE load balancing loss
             
         Returns:
-            Dictionary containing individual and total losses
+            Dictionary with loss components
         """
-        losses = {}
-        
         # Language modeling loss
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        lm_loss = self.lm_loss(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1)
-        )
-        losses["lm_loss"] = lm_loss
+        if logits.dim() == 3:
+            # Flatten for cross entropy
+            lm_loss = self.lm_criterion(
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1)
+            )
+        else:
+            lm_loss = self.lm_criterion(logits, labels)
         
-        # Auxiliary MoE losses
-        total_aux_loss = torch.tensor(0.0, device=logits.device)
+        # Total loss starts with LM loss
+        total_loss = lm_loss
         
+        # Add auxiliary loss if provided
         if aux_loss is not None:
-            total_aux_loss = total_aux_loss + aux_loss
-            losses["moe_aux_loss"] = aux_loss
+            total_loss = total_loss + self.aux_loss_weight * aux_loss
         
-        if routing_weights is not None:
-            # Load balance loss
-            lb_loss = self.load_balance_loss(routing_weights)
-            total_aux_loss = total_aux_loss + lb_loss
-            losses["load_balance_loss"] = lb_loss
+        return {
+            "loss": total_loss,
+            "lm_loss": lm_loss,
+            "aux_loss": aux_loss if aux_loss is not None else torch.tensor(0.0, device=lm_loss.device)
+        }
+
+
+class AuxiliaryLoss(nn.Module):
+    """Auxiliary loss for load balancing in MoE"""
+    
+    def __init__(self, num_experts: int, top_k: int):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+    
+    def forward(self, gate_logits: torch.Tensor, expert_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Compute load balancing auxiliary loss
+        
+        Args:
+            gate_logits: Gating logits [batch_size, num_experts]
+            expert_mask: Binary mask of selected experts [batch_size, num_experts]
             
-            # Router entropy loss
-            entropy_loss = self.router_entropy_loss(routing_weights)
-            total_aux_loss = total_aux_loss + entropy_loss
-            losses["router_entropy_loss"] = entropy_loss
+        Returns:
+            Auxiliary loss scalar
+        """
+        # Compute gate probabilities
+        gate_probs = torch.softmax(gate_logits, dim=-1)
         
-        losses["aux_loss"] = total_aux_loss
+        # Average gate probability per expert
+        avg_gate_probs = gate_probs.mean(dim=0)  # [num_experts]
         
-        # Combined loss
-        total_loss = lm_loss + self.aux_loss_weight * total_aux_loss
-        losses["loss"] = total_loss
+        # Average expert selection frequency  
+        avg_expert_freq = expert_mask.float().mean(dim=0)  # [num_experts]
         
-        return losses
+        # Load balancing loss - encourage uniform distribution
+        aux_loss = (avg_gate_probs * avg_expert_freq).sum() * self.num_experts / self.top_k
+        
+        return aux_loss
 
 
 class LoadBalanceLoss(nn.Module):
@@ -160,22 +169,16 @@ class RouterEntropyLoss(nn.Module):
         return entropy_loss
 
 
-class AuxiliaryLoss(nn.Module):
+class ExpertDiversityLoss(nn.Module):
     """
-    Additional auxiliary losses for ChartExpert-MoE
+    Expert diversity loss to encourage diversity among expert outputs
     """
     
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, diversity_weight: float = 0.01):
         super().__init__()
-        self.config = config
-        
-        # Expert diversity loss
-        self.diversity_weight = config.get("diversity_weight", 0.01)
-        
-        # Consistency loss for cross-modal alignment
-        self.consistency_weight = config.get("consistency_weight", 0.1)
-        
-    def expert_diversity_loss(
+        self.diversity_weight = diversity_weight
+    
+    def forward(
         self,
         expert_outputs: List[torch.Tensor]
     ) -> torch.Tensor:
@@ -210,8 +213,18 @@ class AuxiliaryLoss(nn.Module):
         diversity_loss = diversity_loss / max(num_pairs, 1)
         
         return diversity_loss * self.diversity_weight
+
+
+class CrossModalConsistencyLoss(nn.Module):
+    """
+    Cross-modal consistency loss to ensure consistency between visual and textual representations
+    """
     
-    def cross_modal_consistency_loss(
+    def __init__(self, consistency_weight: float = 0.1):
+        super().__init__()
+        self.consistency_weight = consistency_weight
+    
+    def forward(
         self,
         visual_features: torch.Tensor,
         text_features: torch.Tensor,
