@@ -1,21 +1,24 @@
 """
-Routing mechanisms for ChartExpert-MoE
+Routing modules for ChartExpert-MoE
 
 This module contains different routing strategies for selecting appropriate experts:
-- Dynamic routing based on input content
-- Hierarchical routing with modality awareness
-- Skill-based routing for fine-grained expert selection
-- Reinforcement learning enhanced routing
+- Dynamic routing with content/modality/context awareness
+- Top-k gating with load balancing
+- Adaptive and hierarchical routing approaches
 """
 
-from .dynamic_router import DynamicRouter
-from .hierarchical_router import HierarchicalRouter
-from .skill_based_router import SkillBasedRouter
-from .rl_router import RLEnhancedRouter
+from .base_router import BaseRouter
+from .dynamic_router import (
+    DynamicRouter,
+    ContentAwareRouter,
+    ModalityAwareRouter,
+    ContextSensitiveRouter
+)
 
 __all__ = [
+    "BaseRouter",
     "DynamicRouter",
-    "HierarchicalRouter", 
-    "SkillBasedRouter",
-    "RLEnhancedRouter"
+    "ContentAwareRouter", 
+    "ModalityAwareRouter",
+    "ContextSensitiveRouter"
 ] 

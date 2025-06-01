@@ -28,11 +28,13 @@ llm_backbone:
 
 # MoE layer configuration
 moe:
-  num_experts: 10
+  num_experts: 12
   top_k: 2
   capacity_factor: 1.25
   aux_loss_weight: 0.01
   load_balancing: true
+  noisy_gating: true
+  noise_eps: 0.01
 
 # Expert module configurations
 experts:
@@ -100,31 +102,63 @@ experts:
     dropout_rate: 0.1
     num_heads: 8
   
+  chart_to_graph:
+    expert_type: "chart_to_graph"
+    hidden_size: 768
+    expert_hidden_size: 1024
+    dropout_rate: 0.1
+    num_gnn_layers: 3
+    graph_hidden_dim: 512
+    num_heads: 8
+  
   # Cognitive Effort Modulation Experts
+  shallow_reasoning:
+    expert_type: "shallow_reasoning"
+    hidden_size: 768
+    expert_hidden_size: 512
+    dropout_rate: 0.1
+    num_heads: 4
+    fast_mode: true
+  
   orchestrator:
     expert_type: "orchestrator"
     hidden_size: 768
-    expert_hidden_size: 2048  # Larger for complex reasoning
+    expert_hidden_size: 2048
     dropout_rate: 0.1
     num_heads: 12
 
 # Routing configuration
 routing:
-  routing_strategy: "learned"  # Options: learned, rule_based, hybrid
+  routing_strategy: "learned"
   hidden_size: 768
-  num_experts: 10
+  num_experts: 12
   top_k: 2
   load_balancing: true
   balance_weight: 0.01
+  capacity_factor: 1.25
+  batch_priority_routing: true
 
 # Fusion configuration
 fusion:
-  fusion_type: "dynamic_gated"  # Options: concat, attention, dynamic_gated
+  fusion_type: "dynamic_gated"  # Options: concat, attention, dynamic_gated, film_guided, graph_based
   hidden_size: 768
   vision_hidden_size: 768
   text_hidden_size: 4096
   num_heads: 8
   dropout_rate: 0.1
+  
+  # FILM-guided fusion options
+  film_guided:
+    enabled: false
+    language_conditioning: true
+    visual_modulation: true
+  
+  # Graph-based fusion options
+  graph_based:
+    enabled: false
+    num_gnn_layers: 3
+    graph_hidden_dim: 512
+    use_gat: true
 
 # Training configuration
 training:
@@ -177,6 +211,7 @@ training:
 data:
   max_length: 512
   image_size: [224, 224]
+  use_native_resolution: true  # For MoonViT
   
   # Dataset paths
   chartmuseum_cache_dir: "./data/cache/chartmuseum"
@@ -186,9 +221,21 @@ data:
   # Data augmentation
   augmentation:
     enabled: true
+    # Visual augmentations (preserve chart semantics)
     rotation_range: 5
     brightness_range: 0.1
     contrast_range: 0.1
+    color_jitter: 0.05
+    # Chart-specific augmentations
+    axis_noise: 0.02  # Add noise to axis labels
+    legend_position_variation: true
+    synthetic_chart_generation: true
+    
+  # Robustness enhancements
+  robustness:
+    add_visual_perturbations: true
+    perturbation_types: ["color_shift", "style_transfer", "compression"]
+    perturbation_probability: 0.2
 
 # Evaluation configuration
 evaluation:
@@ -197,14 +244,16 @@ evaluation:
     - "rouge"
     - "bleu"
     - "bert_score"
+    - "visual_reasoning_gap"  # Custom metric
+    - "error_analysis"  # Detailed error categorization
   
   # ChartMuseum specific evaluation
   chartmuseum:
     reasoning_types:
-      - "visual"
-      - "textual"
-      - "mixed"
-      - "compositional"
+      - "text_dominant"
+      - "visual_dominant"  
+      - "text_visual_combined"
+      - "comprehensive"
     
     chart_types:
       - "bar_chart"
@@ -212,6 +261,24 @@ evaluation:
       - "pie_chart"
       - "scatter_plot"
       - "area_chart"
+      - "heatmap"
+      - "box_plot"
+      - "radar_chart"
+    
+    error_categories:
+      - "symbol_selection"
+      - "visual_comparison"
+      - "trajectory_tracking"
+      - "xy_value_identification"
+      - "ocr_error"
+      - "logical_error"
+      - "hallucination"
+      
+  # Human evaluation
+  human_eval:
+    enabled: false
+    sample_size: 100
+    criteria: ["correctness", "coherence", "faithfulness"]
 
 # Logging and monitoring
 logging:
@@ -241,4 +308,45 @@ hardware:
   deepspeed:
     stage: 2
     offload_optimizer: false
-    offload_params: false 
+    offload_params: false
+
+# Performance optimization
+optimization:
+  # FlashAttention
+  use_flash_attention: true
+  attention_dropout: 0.1
+  
+  # Quantization
+  quantization:
+    enabled: false  # Enable for deployment
+    type: "dynamic"  # Options: dynamic, static, qat
+    bits: 8
+    quantize_experts: true
+    
+  # Pruning
+  pruning:
+    enabled: false  # Enable after training
+    ratio: 0.1
+    method: "structured"
+    prune_experts: true
+    expert_importance_threshold: 0.05
+    
+  # Knowledge distillation
+  distillation:
+    enabled: false
+    teacher_model: "chart_expert_large"
+    temperature: 3.0
+    alpha: 0.7
+    
+  # Inference optimization
+  inference:
+    batch_priority_routing: true
+    expert_caching: true
+    dynamic_batching: true
+    max_batch_size: 32
+    
+  # Memory optimization
+  memory:
+    gradient_checkpointing: true
+    expert_offloading: false  # For very large models
+    mixed_precision_training: true 
