@@ -31,11 +31,10 @@ class LayoutDetectionExpert(BaseExpert):
     
     def __init__(self, config: Dict[str, Any]):
         config["expert_type"] = "layout"
-        super().__init__(config)
-        
-        # Visual feature extraction for layout analysis
         self.visual_feature_dim = config.get("visual_feature_dim", 2048)
+        super().__init__(config)
         self.use_object_detection = config.get("use_object_detection", True)
+        self.num_heads = config.get("num_heads", 8)
         
         # For object detection-like capabilities
         if self.use_object_detection:
