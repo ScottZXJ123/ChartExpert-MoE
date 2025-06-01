@@ -47,7 +47,7 @@ def test_architecture():
     expected_experts = [
         "layout_expert", "ocr_expert", "scale_expert", "geometric_expert", "trend_expert",
         "query_expert", "numerical_expert", "integration_expert", 
-        "alignment_expert", "orchestrator_expert"
+        "alignment_expert", "chart_to_graph_expert", "shallow_reasoning_expert", "orchestrator_expert"
     ]
     
     for expert_name in expected_experts:
@@ -99,10 +99,13 @@ def test_architecture():
         # Check expert activation
         avg_activation = routing_weights.mean(dim=(0, 1))
         print("\nAverage expert activation:")
-        expert_names = ["layout", "ocr", "scale", "geometric", "trend",
-                       "query", "numerical", "integration", "alignment", "orchestrator"]
+        expert_names = [
+            "layout", "ocr", "scale", "geometric", "trend",
+            "query", "numerical", "integration", "alignment", 
+            "chart_to_graph", "shallow_reasoning", "orchestrator"
+        ]
         for i, (name, activation) in enumerate(zip(expert_names, avg_activation)):
-            print(f"  {name:12}: {activation:.3f}")
+            print(f"  {name:18}: {activation:.3f}")
     
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())

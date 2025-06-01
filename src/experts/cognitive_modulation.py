@@ -166,6 +166,10 @@ class DeepReasoningOrchestratorExpert(BaseExpert):
             batch_first=True
         )
         
+        # Projector for expert_weights before synthesis
+        # Assuming 10 experts as hardcoded in expert_selector and expert_reinforcement
+        self.expert_weights_projector = nn.Linear(10, self.hidden_size)
+
         # Solution synthesizer
         self.solution_synthesizer = nn.Sequential(
             nn.Linear(self.hidden_size * 2, self.hidden_size * 2),
@@ -253,9 +257,10 @@ class DeepReasoningOrchestratorExpert(BaseExpert):
     ) -> torch.Tensor:
         """Synthesize final solution from orchestrated reasoning"""
         # Combine orchestrated features with expert selection context
+        projected_expert_weights = self.expert_weights_projector(expert_weights)
         combined_input = torch.cat([
             orchestrated_features,
-            expert_weights
+            projected_expert_weights
         ], dim=-1)
         
         synthesized_solution = self.solution_synthesizer(combined_input)

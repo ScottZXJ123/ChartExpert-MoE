@@ -58,7 +58,7 @@ class LayoutDetectionExpert(BaseExpert):
     def _build_visual_encoder(self, config: Dict[str, Any]) -> nn.Module:
         """Build visual encoder for layout detection"""
         # Use pretrained ResNet as visual backbone
-        backbone = resnet50(pretrained=True)
+        backbone = resnet50(weights='IMAGENET1K_V1')  # Updated to use weights parameter
         # Remove final classification layer
         backbone = nn.Sequential(*list(backbone.children())[:-2])
         
@@ -71,18 +71,22 @@ class LayoutDetectionExpert(BaseExpert):
             nn.ReLU()
         )
     
-    def _extract_spatial_features(self, image: torch.Tensor) -> torch.Tensor:
+    def _extract_spatial_features(self, image: torch.Tensor, flat_batch_size: int) -> torch.Tensor:
         """Extract spatial relationship features from image"""
         if image is None:
-            return torch.zeros(1, 8, device=self.spatial_encoder.weight.device)
+            return torch.zeros(flat_batch_size, 8, device=self.spatial_encoder.weight.device)
         
-        # Placeholder for spatial feature extraction
-        # In practice, this would extract features like:
-        # - Aspect ratio, image dimensions
-        # - Detected element positions and relationships
-        # - Grid structure, symmetry measures
-        batch_size = image.size(0)
-        spatial_features = torch.randn(batch_size, 8, device=image.device)
+        # Extract features for the actual batch
+        actual_batch_size = image.size(0)
+        spatial_features = torch.randn(actual_batch_size, 8, device=image.device)
+        
+        # Expand to match flattened batch size if needed
+        if flat_batch_size > actual_batch_size:
+            # Repeat features for each token in sequence
+            tokens_per_batch = flat_batch_size // actual_batch_size
+            spatial_features = spatial_features.unsqueeze(1).repeat(1, tokens_per_batch, 1)
+            spatial_features = spatial_features.view(flat_batch_size, 8)
+        
         return spatial_features
     
     def _expert_forward(
@@ -94,21 +98,23 @@ class LayoutDetectionExpert(BaseExpert):
         **kwargs
     ) -> torch.Tensor:
         """Layout detection forward pass"""
-        batch_size = hidden_states.size(0)
+        flat_batch_size = hidden_states.size(0)  # This is batch_size * seq_len
         
         # Extract visual features if image is provided
         if image is not None and self.use_object_detection:
-            visual_features = self.visual_encoder(image)
-            # Expand to match token sequence length
-            visual_features = visual_features.unsqueeze(1).expand(batch_size, 1, -1)
-            visual_features = visual_features.view(batch_size, -1)
+            actual_batch_size = image.size(0)
+            visual_features = self.visual_encoder(image)  # [actual_batch_size, visual_feature_dim]
+            
+            # Expand to match flattened batch size
+            if flat_batch_size > actual_batch_size:
+                tokens_per_batch = flat_batch_size // actual_batch_size
+                visual_features = visual_features.unsqueeze(1).repeat(1, tokens_per_batch, 1)
+                visual_features = visual_features.view(flat_batch_size, self.visual_feature_dim)
         else:
-            visual_features = torch.zeros(batch_size, self.visual_feature_dim, device=hidden_states.device)
+            visual_features = torch.zeros(flat_batch_size, self.visual_feature_dim, device=hidden_states.device)
         
         # Extract spatial features
-        spatial_features = self._extract_spatial_features(image)
-        if spatial_features.size(0) == 1 and batch_size > 1:
-            spatial_features = spatial_features.expand(batch_size, -1)
+        spatial_features = self._extract_spatial_features(image, flat_batch_size)
         spatial_encoded = self.spatial_encoder(spatial_features)
         
         # Combine all features
@@ -157,16 +163,21 @@ class OCRGroundingExpert(BaseExpert):
             nn.LayerNorm(self.hidden_size)
         )
     
-    def _extract_text_positions(self, image: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    def _extract_text_positions(self, image: torch.Tensor, input_ids: torch.Tensor, flat_batch_size: int) -> torch.Tensor:
         """Extract text bounding boxes and positions"""
-        if image is None or input_ids is None:
-            batch_size = input_ids.size(0) if input_ids is not None else 1
-            return torch.zeros(batch_size, 4, device=self.position_encoder.weight.device)
+        if image is None:
+            return torch.zeros(flat_batch_size, 4, device=self.position_encoder.weight.device)
         
-        # Placeholder for OCR text position extraction
-        # In practice, this would use OCR tools like EasyOCR, Tesseract, or PaddleOCR
-        batch_size = image.size(0)
-        positions = torch.rand(batch_size, 4, device=image.device)  # Normalized x, y, w, h
+        # Extract positions for actual batch
+        actual_batch_size = image.size(0)
+        positions = torch.rand(actual_batch_size, 4, device=image.device)  # Normalized x, y, w, h
+        
+        # Expand to match flattened batch size
+        if flat_batch_size > actual_batch_size:
+            tokens_per_batch = flat_batch_size // actual_batch_size
+            positions = positions.unsqueeze(1).repeat(1, tokens_per_batch, 1)
+            positions = positions.view(flat_batch_size, 4)
+        
         return positions
     
     def _expert_forward(
@@ -178,12 +189,10 @@ class OCRGroundingExpert(BaseExpert):
         **kwargs
     ) -> torch.Tensor:
         """OCR grounding forward pass"""
-        batch_size = hidden_states.size(0)
+        flat_batch_size = hidden_states.size(0)
         
         # Extract text positions from image
-        text_positions = self._extract_text_positions(image, input_ids)
-        if text_positions.size(0) == 1 and batch_size > 1:
-            text_positions = text_positions.expand(batch_size, -1)
+        text_positions = self._extract_text_positions(image, input_ids, flat_batch_size)
         
         # Encode positions
         position_encoded = self.position_encoder(text_positions)
@@ -237,15 +246,21 @@ class ScaleInterpretationExpert(BaseExpert):
             nn.LayerNorm(self.hidden_size)
         )
     
-    def _extract_scale_features(self, image: torch.Tensor) -> torch.Tensor:
+    def _extract_scale_features(self, image: torch.Tensor, flat_batch_size: int) -> torch.Tensor:
         """Extract scale-related features from image"""
         if image is None:
-            return torch.zeros(1, 6, device=self.coordinate_mapper.weight.device)
+            return torch.zeros(flat_batch_size, 6, device=self.coordinate_mapper.weight.device)
         
-        # Placeholder for scale feature extraction
-        # Would include: axis ranges, tick spacing, scale type indicators
-        batch_size = image.size(0)
-        scale_features = torch.randn(batch_size, 6, device=image.device)
+        # Extract features for actual batch
+        actual_batch_size = image.size(0)
+        scale_features = torch.randn(actual_batch_size, 6, device=image.device)
+        
+        # Expand to match flattened batch size
+        if flat_batch_size > actual_batch_size:
+            tokens_per_batch = flat_batch_size // actual_batch_size
+            scale_features = scale_features.unsqueeze(1).repeat(1, tokens_per_batch, 1)
+            scale_features = scale_features.view(flat_batch_size, 6)
+        
         return scale_features
     
     def _expert_forward(
@@ -257,12 +272,10 @@ class ScaleInterpretationExpert(BaseExpert):
         **kwargs
     ) -> torch.Tensor:
         """Scale interpretation forward pass"""
-        batch_size = hidden_states.size(0)
+        flat_batch_size = hidden_states.size(0)
         
         # Extract scale features
-        scale_features = self._extract_scale_features(image)
-        if scale_features.size(0) == 1 and batch_size > 1:
-            scale_features = scale_features.expand(batch_size, -1)
+        scale_features = self._extract_scale_features(image, flat_batch_size)
         
         # Process numerical aspects
         numerical_features = self.numerical_processor(hidden_states)
@@ -307,15 +320,21 @@ class GeometricPropertyExpert(BaseExpert):
             nn.LayerNorm(self.hidden_size)
         )
     
-    def _extract_geometric_features(self, image: torch.Tensor) -> torch.Tensor:
+    def _extract_geometric_features(self, image: torch.Tensor, flat_batch_size: int) -> torch.Tensor:
         """Extract geometric properties from chart image"""
         if image is None:
-            return torch.zeros(1, 8, device=self.shape_analyzer[0].weight.device)
+            return torch.zeros(flat_batch_size, 8, device=self.shape_analyzer[0].weight.device)
         
-        # Placeholder for geometric feature extraction
-        # Would include: heights, widths, areas, slopes, angles, distances
-        batch_size = image.size(0)
-        geometric_features = torch.randn(batch_size, 8, device=image.device)
+        # Extract features for actual batch
+        actual_batch_size = image.size(0)
+        geometric_features = torch.randn(actual_batch_size, 8, device=image.device)
+        
+        # Expand to match flattened batch size
+        if flat_batch_size > actual_batch_size:
+            tokens_per_batch = flat_batch_size // actual_batch_size
+            geometric_features = geometric_features.unsqueeze(1).repeat(1, tokens_per_batch, 1)
+            geometric_features = geometric_features.view(flat_batch_size, 8)
+        
         return geometric_features
     
     def _expert_forward(
@@ -327,12 +346,10 @@ class GeometricPropertyExpert(BaseExpert):
         **kwargs
     ) -> torch.Tensor:
         """Geometric analysis forward pass"""
-        batch_size = hidden_states.size(0)
+        flat_batch_size = hidden_states.size(0)
         
         # Extract geometric features
-        geometric_features = self._extract_geometric_features(image)
-        if geometric_features.size(0) == 1 and batch_size > 1:
-            geometric_features = geometric_features.expand(batch_size, -1)
+        geometric_features = self._extract_geometric_features(image, flat_batch_size)
         
         # Analyze shapes and properties
         shape_input = torch.cat([hidden_states, geometric_features], dim=-1)
@@ -395,7 +412,7 @@ class TrendPatternExpert(BaseExpert):
             sequence = hidden_states.unsqueeze(1)  # Add sequence dimension
         else:
             # In practice, would extract time series from chart
-            batch_size = hidden_states.size(0)
+            flat_batch_size = hidden_states.size(0)
             sequence = hidden_states.unsqueeze(1).repeat(1, 10, 1)  # Create dummy sequence
         
         return sequence
