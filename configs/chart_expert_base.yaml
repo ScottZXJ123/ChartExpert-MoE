@@ -1,0 +1,244 @@
+# ChartExpert-MoE Base Configuration
+# This file contains the basic configuration for the ChartExpert-MoE model
+
+model_name: "chart_expert_moe_base"
+version: "0.1.0"
+
+# Global model parameters
+hidden_size: 768
+vocab_size: 32000
+max_length: 512
+aux_loss_weight: 0.01
+
+# Vision encoder configuration
+vision_encoder:
+  encoder_type: "clip"  # Options: clip, siglip, dinov2, moonvit
+  model_name: "openai/clip-vit-base-patch32"
+  hidden_size: 768
+  max_patches: 196
+  use_fp16: false
+
+# LLM backbone configuration  
+llm_backbone:
+  model_name: "meta-llama/Llama-2-7b-hf"  # Options: llama, qwen, gemma
+  hidden_size: 4096
+  vision_hidden_size: 768
+  use_fp16: true
+  use_device_map: true
+
+# MoE layer configuration
+moe:
+  num_experts: 10
+  top_k: 2
+  capacity_factor: 1.25
+  aux_loss_weight: 0.01
+  load_balancing: true
+
+# Expert module configurations
+experts:
+  # Visual-Spatial & Structural Experts
+  layout:
+    expert_type: "layout"
+    hidden_size: 768
+    expert_hidden_size: 1024
+    dropout_rate: 0.1
+    visual_feature_dim: 2048
+    use_object_detection: true
+    num_heads: 8
+  
+  ocr:
+    expert_type: "ocr"
+    hidden_size: 768
+    expert_hidden_size: 1024
+    dropout_rate: 0.1
+    num_heads: 8
+  
+  scale:
+    expert_type: "scale" 
+    hidden_size: 768
+    expert_hidden_size: 1024
+    dropout_rate: 0.1
+  
+  geometric:
+    expert_type: "geometric"
+    hidden_size: 768
+    expert_hidden_size: 1024
+    dropout_rate: 0.1
+  
+  trend:
+    expert_type: "trend"
+    hidden_size: 768
+    expert_hidden_size: 1024
+    dropout_rate: 0.1
+  
+  # Semantic & Relational Experts
+  query:
+    expert_type: "query"
+    hidden_size: 768
+    expert_hidden_size: 1024
+    dropout_rate: 0.1
+    num_heads: 8
+  
+  numerical:
+    expert_type: "numerical"
+    hidden_size: 768
+    expert_hidden_size: 1024
+    dropout_rate: 0.1
+  
+  integration:
+    expert_type: "integration"
+    hidden_size: 768
+    expert_hidden_size: 1024
+    dropout_rate: 0.1
+    num_heads: 8
+  
+  # Cross-Modal Fusion & Reasoning Experts  
+  alignment:
+    expert_type: "alignment"
+    hidden_size: 768
+    expert_hidden_size: 1024
+    dropout_rate: 0.1
+    num_heads: 8
+  
+  # Cognitive Effort Modulation Experts
+  orchestrator:
+    expert_type: "orchestrator"
+    hidden_size: 768
+    expert_hidden_size: 2048  # Larger for complex reasoning
+    dropout_rate: 0.1
+    num_heads: 12
+
+# Routing configuration
+routing:
+  routing_strategy: "learned"  # Options: learned, rule_based, hybrid
+  hidden_size: 768
+  num_experts: 10
+  top_k: 2
+  load_balancing: true
+  balance_weight: 0.01
+
+# Fusion configuration
+fusion:
+  fusion_type: "dynamic_gated"  # Options: concat, attention, dynamic_gated
+  hidden_size: 768
+  vision_hidden_size: 768
+  text_hidden_size: 4096
+  num_heads: 8
+  dropout_rate: 0.1
+
+# Training configuration
+training:
+  # Multi-stage training
+  stages:
+    foundation:
+      epochs: 5
+      learning_rate: 1e-4
+      batch_size: 32
+      warmup_steps: 1000
+      
+    joint_pretrain:
+      epochs: 10
+      learning_rate: 5e-5
+      batch_size: 16
+      warmup_steps: 2000
+      
+    chart_tuning:
+      epochs: 15
+      learning_rate: 2e-5
+      batch_size: 8
+      warmup_steps: 1000
+      
+    expert_specialization:
+      epochs: 10
+      learning_rate: 1e-5
+      batch_size: 8
+      warmup_steps: 500
+      
+    chartmuseum_finetune:
+      epochs: 5
+      learning_rate: 5e-6
+      batch_size: 4
+      warmup_steps: 200
+
+  # Optimization
+  optimizer: "adamw"
+  weight_decay: 0.01
+  gradient_clip_norm: 1.0
+  
+  # Scheduler
+  scheduler: "cosine"
+  min_learning_rate: 1e-7
+  
+  # Mixed precision
+  use_fp16: true
+  use_deepspeed: false
+
+# Data configuration
+data:
+  max_length: 512
+  image_size: [224, 224]
+  
+  # Dataset paths
+  chartmuseum_cache_dir: "./data/cache/chartmuseum"
+  chartqa_cache_dir: "./data/cache/chartqa"
+  plotqa_data_dir: "./data/plotqa"
+  
+  # Data augmentation
+  augmentation:
+    enabled: true
+    rotation_range: 5
+    brightness_range: 0.1
+    contrast_range: 0.1
+
+# Evaluation configuration
+evaluation:
+  metrics:
+    - "accuracy"
+    - "rouge"
+    - "bleu"
+    - "bert_score"
+  
+  # ChartMuseum specific evaluation
+  chartmuseum:
+    reasoning_types:
+      - "visual"
+      - "textual"
+      - "mixed"
+      - "compositional"
+    
+    chart_types:
+      - "bar_chart"
+      - "line_chart"
+      - "pie_chart"
+      - "scatter_plot"
+      - "area_chart"
+
+# Logging and monitoring
+logging:
+  log_level: "INFO"
+  log_dir: "./logs"
+  tensorboard_dir: "./logs/tensorboard"
+  wandb:
+    enabled: true
+    project: "chartexpert-moe"
+    entity: "your-entity"
+  
+  # Checkpoint configuration
+  checkpoints:
+    save_dir: "./checkpoints"
+    save_every_n_steps: 1000
+    keep_last_n: 5
+    save_best: true
+
+# Hardware configuration
+hardware:
+  device: "auto"  # auto, cpu, cuda
+  num_gpus: 1
+  mixed_precision: true
+  gradient_checkpointing: false
+  
+  # DeepSpeed configuration (if enabled)
+  deepspeed:
+    stage: 2
+    offload_optimizer: false
+    offload_params: false 
