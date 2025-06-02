@@ -170,7 +170,7 @@ data/cache/
 
 # Model checkpoints and outputs
 checkpoints/
-models/
+/models/
 outputs/
 wandb/
 
