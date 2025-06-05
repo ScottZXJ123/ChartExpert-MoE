@@ -277,6 +277,29 @@ class AdaptiveMemoryManager(ExpertMemoryManager):
         # 自适应参数
         self.load_latency_threshold = config.get("load_latency_threshold", 0.1)  # 加载延迟阈值
         self.memory_pressure_threshold = config.get("memory_pressure_threshold", 0.9)
+        
+        # 专家重要性和优先级管理
+        self.expert_importance_scores = defaultdict(float)
+        self.expert_priority_queue = []
+        self.importance_decay = config.get("importance_decay", 0.95)
+        
+        # 任务复杂度历史追踪
+        self.complexity_history = deque(maxlen=100)
+        self.complexity_weights = {
+            'simple': 0.3,
+            'medium': 0.7, 
+            'complex': 1.0
+        }
+        
+        # CUDA流池用于异步操作
+        if torch.cuda.is_available():
+            self.loading_streams = [torch.cuda.Stream() for _ in range(4)]
+        else:
+            self.loading_streams = []
+            
+        # 预测模型状态
+        self.predicted_experts_cache = {}
+        self.prediction_accuracy = 0.8
     
     def get_expert_for_computation(self, expert_id: int) -> nn.Module:
         """重写以支持自适应优化"""
@@ -311,4 +334,158 @@ class AdaptiveMemoryManager(ExpertMemoryManager):
                     self._emergency_memory_cleanup()
         
         # 优化专家布局
-        self.optimize_memory_layout() 
+        self.optimize_memory_layout()
+    
+    def adaptive_expert_loading(
+        self, 
+        predicted_experts: List[int], 
+        current_task_complexity: float
+    ) -> List[int]:
+        """
+        根据任务复杂度和专家重要性自适应加载专家
+        
+        Args:
+            predicted_experts: 预测需要的专家ID列表
+            current_task_complexity: 当前任务复杂度 [0, 1]
+            
+        Returns:
+            实际加载的专家ID列表
+        """
+        # 更新复杂度历史
+        self.complexity_history.append(current_task_complexity)
+        
+        # 计算每个专家的综合优先级分数
+        expert_scores = {}
+        current_time = time.time()
+        
+        for expert_id in predicted_experts:
+            if expert_id >= len(self.experts) or expert_id < 0:
+                continue
+                
+            # 使用频率得分
+            usage_freq = self.expert_usage_count.get(expert_id, 0) / max(1, sum(self.expert_usage_count.values()))
+            
+            # 重要性得分
+            importance = self.expert_importance_scores[expert_id]
+            
+            # 最近使用得分 (recency bias)
+            last_used = self.expert_last_used.get(expert_id, 0)
+            recency = 1.0 / (current_time - last_used + 1)
+            
+            # 复杂度适应得分
+            complexity_boost = min(2.0, current_task_complexity + 0.5)
+            
+            # 内存效率得分 (更小的专家有轻微优势)
+            memory_cost = self._estimate_expert_memory_usage(expert_id)
+            efficiency = 1.0 / (memory_cost + 0.1)
+            
+            # 综合评分 (权重可调)
+            expert_scores[expert_id] = (
+                0.3 * usage_freq +           # 使用频率
+                0.25 * importance +          # 历史重要性
+                0.2 * recency +              # 最近使用
+                0.15 * complexity_boost +    # 复杂度适应
+                0.1 * efficiency             # 内存效率
+            )
+        
+        # 按评分排序
+        sorted_experts = sorted(expert_scores.items(), key=lambda x: x[1], reverse=True)
+        
+        # 根据可用内存和复杂度决定加载数量
+        available_memory = self._get_available_gpu_memory()
+        max_concurrent_experts = self._calculate_max_experts(available_memory, current_task_complexity)
+        
+        loaded_experts = []
+        total_memory_used = 0
+        
+        # 智能加载策略
+        for expert_id, score in sorted_experts:
+            if len(loaded_experts) >= max_concurrent_experts:
+                break
+                
+            expert_memory = self._estimate_expert_memory_usage(expert_id)
+            
+            if total_memory_used + expert_memory <= available_memory * 0.9:  # 留10%缓冲
+                if expert_id not in self.active_experts:
+                    self._async_load_expert_to_gpu(expert_id)
+                
+                loaded_experts.append(expert_id)
+                total_memory_used += expert_memory
+                
+                # 更新重要性得分
+                self.expert_importance_scores[expert_id] *= self.importance_decay
+                self.expert_importance_scores[expert_id] += score * 0.1
+        
+        # 异步卸载不需要的专家
+        self._async_unload_unused_experts(loaded_experts)
+        
+        return loaded_experts
+    
+    def _calculate_max_experts(self, available_memory: float, task_complexity: float) -> int:
+        """根据可用内存和任务复杂度计算最大专家数"""
+        # 基础专家数根据复杂度调整
+        base_experts = int(2 + task_complexity * 4)  # 2-6个专家
+        
+        # 根据内存可用性调整
+        memory_factor = available_memory / (2 * 1024**3)  # 假设2GB为基准
+        memory_adjusted = int(base_experts * min(2.0, memory_factor))
+        
+        return max(1, min(self.max_gpu_experts, memory_adjusted))
+    
+    def _get_available_gpu_memory(self) -> float:
+        """获取可用GPU内存 (字节)"""
+        if not torch.cuda.is_available():
+            return float('inf')  # CPU模式下不限制
+            
+        total_memory = torch.cuda.get_device_properties(0).total_memory
+        allocated_memory = torch.cuda.memory_allocated()
+        
+        return total_memory - allocated_memory
+    
+    def _estimate_expert_memory_usage(self, expert_id: int) -> float:
+        """估算专家的内存使用量 (字节)"""
+        if expert_id >= len(self.experts) or expert_id < 0:
+            return 0.0
+        
+        # 简化估算：根据专家类型估算
+        expert_type_memory = {
+            0: 0.8 * 1024**3,  # layout_expert
+            1: 1.2 * 1024**3,  # ocr_expert (包含OCR模型)
+            2: 0.6 * 1024**3,  # scale_expert
+            3: 0.7 * 1024**3,  # geometric_expert
+            4: 0.9 * 1024**3,  # trend_expert
+            5: 1.0 * 1024**3,  # query_expert
+            6: 1.1 * 1024**3,  # numerical_expert
+            7: 1.3 * 1024**3,  # integration_expert (复杂)
+            8: 1.0 * 1024**3,  # alignment_expert
+            9: 1.2 * 1024**3,  # chart_to_graph_expert
+            10: 0.8 * 1024**3, # shallow_reasoning_expert
+            11: 1.5 * 1024**3  # orchestrator_expert (最复杂)
+        }
+        
+        return expert_type_memory.get(expert_id, 1.0 * 1024**3)
+    
+    def _async_load_expert_to_gpu(self, expert_id: int):
+        """异步加载专家到GPU"""
+        if not torch.cuda.is_available() or not self.loading_streams:
+            self._load_expert_to_gpu(expert_id)
+            return
+        
+        # 使用可用的CUDA流
+        stream_idx = expert_id % len(self.loading_streams)
+        stream = self.loading_streams[stream_idx]
+        
+        with torch.cuda.stream(stream):
+            self._load_expert_to_gpu(expert_id)
+    
+    def _async_unload_unused_experts(self, keep_experts: List[int]):
+        """异步卸载不需要的专家"""
+        for expert_id in list(self.active_experts):
+            if (expert_id not in keep_experts):
+                
+                # 检查是否可以安全卸载 (不在最近使用列表中)
+                current_time = time.time()
+                last_used = self.expert_last_used.get(expert_id, 0)
+                
+                if current_time - last_used > 60:  # 60秒未使用
+                    self._offload_expert_to_cpu(expert_id) 

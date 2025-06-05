@@ -82,7 +82,32 @@ class ChartExpertMoE(nn.Module):
         self.shallow_reasoning_expert = ShallowReasoningExpert(config["experts"]["shallow_reasoning"])
         self.orchestrator_expert = DeepReasoningOrchestratorExpert(config["experts"]["orchestrator"])
         
-        # Collect all experts
+        # Hierarchical expert organization
+        self.expert_levels = nn.ModuleList([
+            # Level 1: Basic visual experts
+            nn.ModuleList([
+                self.layout_expert,
+                self.ocr_expert,
+                self.geometric_expert
+            ]),
+            # Level 2: Semantic understanding experts
+            nn.ModuleList([
+                self.scale_expert,
+                self.trend_expert,
+                self.numerical_expert,
+                self.query_expert
+            ]),
+            # Level 3: High-level reasoning experts
+            nn.ModuleList([
+                self.integration_expert,
+                self.alignment_expert,
+                self.chart_to_graph_expert,
+                self.shallow_reasoning_expert,
+                self.orchestrator_expert
+            ])
+        ])
+        
+        # Collect all experts for compatibility
         self.experts = [
             self.layout_expert,
             self.ocr_expert,
@@ -98,7 +123,18 @@ class ChartExpertMoE(nn.Module):
             self.orchestrator_expert
         ]
         
-        # MoE layer with dynamic routing
+        # Adaptive expert selection
+        self.complexity_estimator = nn.Linear(config["hidden_size"], 1)
+        self.min_experts = config.get("min_experts", 1)
+        self.max_experts = len(self.experts)
+        
+        # Multi-level routers for hierarchical processing
+        self.level_routers = nn.ModuleList([
+            DynamicRouter({**config["routing"], "num_experts": len(level_experts)})
+            for level_experts in self.expert_levels
+        ])
+        
+        # MoE layer with dynamic routing (legacy compatibility)
         self.moe_layer = MoELayer(
             experts=self.experts,
             router=DynamicRouter(config["routing"]),
@@ -120,8 +156,180 @@ class ChartExpertMoE(nn.Module):
         # Initialize optimization components
         self._init_optimization_components()
         
+        # Initialize KV cache and early exit components
+        self._init_inference_optimizations()
+        
         # Initialize weights
         self._init_weights()
+    
+    def _init_inference_optimizations(self):
+        """Initialize inference optimization components"""
+        # KV缓存池
+        self.kv_cache_pool = {}
+        self.cache_size_limit = self.config.get("kv_cache_size_limit", 2 * 1024 * 1024 * 1024)  # 2GB
+        self.cache_hit_count = 0
+        self.cache_miss_count = 0
+        
+        # 早期退出阈值
+        self.confidence_thresholds = {
+            'simple': self.config.get("simple_confidence_threshold", 0.95),
+            'medium': self.config.get("medium_confidence_threshold", 0.90),
+            'complex': self.config.get("complex_confidence_threshold", 0.85)
+        }
+        
+        # 中间层置信度估计器
+        self.intermediate_confidence_estimators = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.config["hidden_size"], self.config["hidden_size"] // 2),
+                nn.ReLU(),
+                nn.Linear(self.config["hidden_size"] // 2, 1),
+                nn.Sigmoid()
+            ) for _ in range(self.config.get("num_early_exit_layers", 3))
+        ])
+        
+        # 早期退出的输出投影层
+        self.early_exit_projections = nn.ModuleList([
+            nn.Linear(self.config["hidden_size"], self.config["vocab_size"])
+            for _ in range(self.config.get("num_early_exit_layers", 3))
+        ])
+    
+    def hierarchical_expert_forward(
+        self,
+        hidden_states: torch.Tensor,
+        image: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Hierarchical expert processing with adaptive selection
+        
+        Args:
+            hidden_states: Input features [batch_size, seq_len, hidden_size]
+            image: Chart image tensor
+            input_ids: Text input token ids
+            attention_mask: Text attention mask
+            
+        Returns:
+            Processed features from hierarchical experts
+        """
+        # Estimate task complexity for adaptive expert selection
+        complexity = torch.sigmoid(self.complexity_estimator(hidden_states.mean(dim=1)))
+        num_experts_per_level = self._adaptive_expert_count(complexity)
+        
+        level_outputs = []
+        current_input = hidden_states
+        
+        for level_idx, (level_experts, router, num_experts) in enumerate(
+            zip(self.expert_levels, self.level_routers, num_experts_per_level)
+        ):
+            # Route to selected experts at this level
+            routing_weights = router(current_input.mean(dim=1))  # [batch_size, num_level_experts]
+            top_k_indices = torch.topk(routing_weights, k=min(num_experts, len(level_experts)), dim=-1).indices
+            
+            # Process with selected experts
+            level_output = self._process_level_experts(
+                current_input, level_experts, top_k_indices, routing_weights,
+                image, input_ids, attention_mask
+            )
+            
+            level_outputs.append(level_output)
+            
+            # Use level output as input for next level (residual connection)
+            current_input = current_input + level_output
+        
+        # Combine all level outputs
+        return sum(level_outputs) / len(level_outputs)
+    
+    def _adaptive_expert_count(self, complexity: torch.Tensor) -> List[int]:
+        """
+        Determine number of experts to use at each level based on complexity
+        
+        Args:
+            complexity: Task complexity scores [batch_size, 1]
+            
+        Returns:
+            List of expert counts for each level
+        """
+        avg_complexity = complexity.mean().item()
+        
+        if avg_complexity < 0.3:
+            # Simple tasks: fewer experts
+            return [1, 2, 1]  # Level 1, 2, 3
+        elif avg_complexity < 0.7:
+            # Medium tasks: moderate expert usage
+            return [2, 3, 2]
+        else:
+            # Complex tasks: use more experts
+            return [3, 4, 3]
+    
+    def _process_level_experts(
+        self,
+        hidden_states: torch.Tensor,
+        level_experts: nn.ModuleList,
+        expert_indices: torch.Tensor,
+        routing_weights: torch.Tensor,
+        image: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Process inputs through selected experts at a specific level
+        
+        Args:
+            hidden_states: Input features
+            level_experts: Experts at this level
+            expert_indices: Selected expert indices [batch_size, k]
+            routing_weights: Expert routing weights
+            image: Chart image tensor
+            input_ids: Text input token ids
+            attention_mask: Text attention mask
+            
+        Returns:
+            Weighted combination of expert outputs
+        """
+        batch_size, seq_len, hidden_size = hidden_states.shape
+        device = hidden_states.device
+        
+        # Initialize output tensor
+        level_output = torch.zeros_like(hidden_states)
+        
+        # Process each expert in parallel when possible
+        expert_outputs = {}
+        
+        # Get unique expert indices across all samples in batch
+        unique_experts = torch.unique(expert_indices).tolist()
+        
+        # Parallel expert processing
+        if len(unique_experts) > 1 and torch.cuda.is_available():
+            # Use CUDA streams for parallel processing
+            streams = [torch.cuda.Stream() for _ in range(min(len(unique_experts), 4))]
+            
+            for idx, expert_id in enumerate(unique_experts):
+                stream = streams[idx % len(streams)]
+                with torch.cuda.stream(stream):
+                    expert_outputs[expert_id] = level_experts[expert_id](
+                        hidden_states, image, input_ids, attention_mask
+                    )
+            
+            # Synchronize all streams
+            for stream in streams:
+                stream.synchronize()
+        else:
+            # Sequential processing for CPU or single expert
+            for expert_id in unique_experts:
+                expert_outputs[expert_id] = level_experts[expert_id](
+                    hidden_states, image, input_ids, attention_mask
+                )
+        
+        # Weighted combination of expert outputs
+        for batch_idx in range(batch_size):
+            for expert_idx_pos in range(expert_indices.shape[1]):
+                expert_id = expert_indices[batch_idx, expert_idx_pos].item()
+                if expert_id < len(level_experts):
+                    weight = routing_weights[batch_idx, expert_id]
+                    level_output[batch_idx] += weight * expert_outputs[expert_id][batch_idx]
+        
+        return level_output
     
     def _init_optimization_components(self):
         """初始化优化组件"""
@@ -207,17 +415,43 @@ class ChartExpertMoE(nn.Module):
             attention_mask=attention_mask
         )  # [batch_size, total_seq_len, hidden_size]
         
-        # MoE processing with expert routing
-        moe_output = self.moe_layer(
-            hidden_states=fused_features,
-            image=image,
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        )
+        # Choose processing strategy: hierarchical or legacy MoE
+        use_hierarchical = self.config.get("use_hierarchical_experts", True)
         
-        expert_outputs = moe_output["expert_outputs"]  # [batch_size, total_seq_len, hidden_size]
-        routing_weights = moe_output["routing_weights"]  # [batch_size, total_seq_len, num_experts]
-        aux_loss = moe_output["aux_loss"]  # Scalar
+        if use_hierarchical:
+            # Hierarchical expert processing with adaptive selection
+            expert_outputs = self.hierarchical_expert_forward(
+                hidden_states=fused_features,
+                image=image,
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
+            
+            # Create compatibility routing weights (average across levels)
+            level_routing_weights = []
+            for router in self.level_routers:
+                level_weights = router(fused_features.mean(dim=1))  # [batch_size, num_level_experts]
+                # Pad to full expert count for compatibility
+                padded_weights = torch.zeros(level_weights.size(0), self.max_experts, device=level_weights.device)
+                padded_weights[:, :level_weights.size(1)] = level_weights
+                level_routing_weights.append(padded_weights)
+            
+            routing_weights = torch.stack(level_routing_weights, dim=1).mean(dim=1)  # [batch_size, num_experts]
+            routing_weights = routing_weights.unsqueeze(1).expand(-1, fused_features.size(1), -1)  # [batch_size, seq_len, num_experts]
+            aux_loss = torch.tensor(0.0, device=expert_outputs.device)
+            
+        else:
+            # Legacy MoE processing for backward compatibility
+            moe_output = self.moe_layer(
+                hidden_states=fused_features,
+                image=image,
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
+            
+            expert_outputs = moe_output["expert_outputs"]  # [batch_size, total_seq_len, hidden_size]
+            routing_weights = moe_output["routing_weights"]  # [batch_size, total_seq_len, num_experts]
+            aux_loss = moe_output["aux_loss"]  # Scalar
         
         # Project expert outputs to LLM hidden size
         expert_outputs_llm = self.expert_to_llm_projection(expert_outputs)
@@ -488,6 +722,129 @@ class ChartExpertMoE(nn.Module):
         
         return moe_output["expert_outputs"]
     
+    def smart_inference(
+        self,
+        image: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        use_early_exit: bool = True,
+        use_kv_cache: bool = True,
+        **kwargs
+    ) -> Dict[str, torch.Tensor]:
+        """
+        智能推理：结合早期退出、KV缓存和层次化专家选择
+        
+        Args:
+            image: Chart image tensor
+            input_ids: Text input token ids  
+            attention_mask: Attention mask
+            use_early_exit: Whether to use early exit optimization
+            use_kv_cache: Whether to use KV caching
+            
+        Returns:
+            Dictionary containing optimized inference results
+        """
+        # 快速复杂度和图表类型检测
+        complexity = self._estimate_query_complexity(input_ids, attention_mask)
+        
+        # 根据复杂度选择推理策略
+        if complexity < 0.3 and not use_early_exit:
+            # 简单查询：快速路径
+            return self._fast_path_inference(image, input_ids, attention_mask, complexity)
+        elif use_kv_cache:
+            # 中等复杂度：使用KV缓存
+            return self.inference_with_kv_cache(image, input_ids, attention_mask, **kwargs)
+        elif use_early_exit and hasattr(self, 'intermediate_confidence_estimators'):
+            # 复杂查询：早期退出
+            return self.inference_with_early_exit(image, input_ids, attention_mask, **kwargs)
+        else:
+            # 回退：标准推理
+            return self.forward(image, input_ids, attention_mask, **kwargs)
+    
+    def inference_with_early_exit(
+        self,
+        image: torch.Tensor, 
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs
+    ) -> Dict[str, torch.Tensor]:
+        """带早期退出的推理"""
+        if not hasattr(self, 'intermediate_confidence_estimators'):
+            # 如果没有早期退出组件，使用标准推理
+            return self.forward(image, input_ids, attention_mask, **kwargs)
+            
+        complexity = self._quick_complexity_assessment(input_ids, attention_mask)
+        confidence_threshold = self.confidence_thresholds.get(complexity, 0.90)
+        
+        # 编码
+        visual_features = self.vision_encoder(image)
+        text_features = self.llm_backbone.encode(input_ids=input_ids, attention_mask=attention_mask)
+        fused_features = self.fusion(
+            visual_features=visual_features,
+            text_features=text_features,
+            attention_mask=attention_mask
+        )
+        
+        # 层次化专家处理
+        if hasattr(self, 'expert_levels'):
+            level_outputs = []
+            current_features = fused_features
+            
+            for level_idx, (level_experts, router) in enumerate(zip(self.expert_levels, self.level_routers)):
+                routing_weights = router(current_features.mean(dim=1))
+                top_k_indices = torch.topk(routing_weights, k=2, dim=-1).indices
+                
+                level_output = self._process_level_experts(
+                    current_features, level_experts, top_k_indices, routing_weights,
+                    image, input_ids, attention_mask
+                )
+                level_outputs.append(level_output)
+                current_features = current_features + level_output
+                
+                # 检查早期退出
+                if level_idx < len(self.intermediate_confidence_estimators):
+                    confidence = self.intermediate_confidence_estimators[level_idx](
+                        current_features.mean(dim=1)
+                    ).mean()
+                    
+                    if confidence > confidence_threshold:
+                        early_logits = self.early_exit_projections[level_idx](current_features)
+                        return {
+                            "logits": early_logits,
+                            "early_exit": True,
+                            "exit_layer": level_idx,
+                            "confidence": confidence.item(),
+                            "complexity": complexity
+                        }
+        
+        # 标准完整推理
+        return self.forward(image, input_ids, attention_mask, **kwargs)
+    
+    def inference_with_kv_cache(
+        self,
+        image: torch.Tensor,
+        input_ids: torch.Tensor, 
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs
+    ) -> Dict[str, torch.Tensor]:
+        """使用KV缓存的推理"""
+        if not hasattr(self, 'kv_cache_pool'):
+            return self.forward(image, input_ids, attention_mask, **kwargs)
+            
+        cache_key = self._generate_cache_key(image, input_ids)
+        
+        if cache_key in self.kv_cache_pool and self._should_use_cache(input_ids):
+            self.cache_hit_count += 1
+            return self.kv_cache_pool[cache_key]
+        else:
+            self.cache_miss_count += 1
+            outputs = self.forward(image, input_ids, attention_mask, **kwargs)
+            
+            if self._should_cache(input_ids, outputs):
+                self._add_to_cache(cache_key, outputs)
+                
+            return outputs
+    
     def predict(
         self,
         image_path: str,
@@ -633,4 +990,120 @@ class ChartExpertMoE(nn.Module):
         with open(f"{save_path}/config.yaml", 'w') as f:
             yaml.dump(self.config, f, default_flow_style=False)
         
-        print(f"Model saved to {save_path}") 
+        print(f"Model saved to {save_path}")
+    
+    # 支持方法
+    def _quick_complexity_assessment(
+        self, 
+        input_ids: torch.Tensor, 
+        attention_mask: Optional[torch.Tensor] = None
+    ) -> str:
+        """快速评估任务复杂度"""
+        seq_len = input_ids.size(1)
+        
+        # 基于序列长度的简单启发式
+        if seq_len < 20:
+            return 'simple'
+        elif seq_len < 50:
+            return 'medium'
+        else:
+            return 'complex'
+    
+    def _generate_cache_key(self, image: torch.Tensor, input_ids: torch.Tensor) -> str:
+        """生成缓存键"""
+        # 使用image和input_ids的哈希作为键
+        image_hash = hash(str(image.shape) + str(image.sum().item()))
+        text_hash = hash(str(input_ids.flatten().tolist()[:10]))  # 只用前10个token
+        return f"{image_hash}_{text_hash}"
+    
+    def _should_use_cache(self, input_ids: torch.Tensor) -> bool:
+        """判断是否应该使用缓存"""
+        # 简单策略：如果序列很短，使用缓存
+        return input_ids.size(1) < 100
+    
+    def _should_cache(self, input_ids: torch.Tensor, outputs: Dict) -> bool:
+        """判断是否应该缓存结果"""
+        # 缓存策略：中等长度的序列，且置信度高
+        seq_len = input_ids.size(1)
+        if seq_len < 10 or seq_len > 200:
+            return False
+        
+        # 检查缓存大小限制
+        if hasattr(self, 'kv_cache_pool'):
+            current_cache_size = sum(
+                len(str(kv)) for kv in self.kv_cache_pool.values()
+            )
+            return current_cache_size < getattr(self, 'cache_size_limit', 2 * 1024**3)
+        
+        return True
+    
+    def _add_to_cache(self, cache_key: str, outputs: Dict):
+        """添加到缓存"""
+        if hasattr(self, 'kv_cache_pool'):
+            self.kv_cache_pool[cache_key] = outputs
+            
+            # 如果缓存过大，删除最旧的条目
+            if len(self.kv_cache_pool) > 1000:  # 最多1000个条目
+                oldest_key = next(iter(self.kv_cache_pool))
+                del self.kv_cache_pool[oldest_key]
+    
+    def get_optimization_stats(self) -> Dict[str, Any]:
+        """获取所有优化统计信息"""
+        stats = {
+            "model_type": "ChartExpert-MoE",
+            "optimizations_enabled": []
+        }
+        
+        # 层次化专家统计
+        if hasattr(self, 'expert_levels'):
+            stats["optimizations_enabled"].append("hierarchical_experts")
+            stats["expert_levels"] = len(self.expert_levels)
+            stats["experts_per_level"] = [len(level) for level in self.expert_levels]
+        
+        # 缓存统计
+        if hasattr(self, 'kv_cache_pool'):
+            stats["optimizations_enabled"].append("kv_cache")
+            stats["cache_stats"] = self.get_cache_stats()
+        
+        # 早期退出统计
+        if hasattr(self, 'intermediate_confidence_estimators'):
+            stats["optimizations_enabled"].append("early_exit")
+            stats["early_exit_layers"] = len(self.intermediate_confidence_estimators)
+        
+        # 内存管理统计
+        if hasattr(self, 'memory_manager') and self.memory_manager:
+            stats["optimizations_enabled"].append("memory_management")
+            stats["memory_stats"] = self.memory_manager.get_memory_stats()
+        
+        return stats
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """获取缓存统计信息"""
+        if not hasattr(self, 'kv_cache_pool'):
+            return {"cache_enabled": False}
+            
+        total_requests = getattr(self, 'cache_hit_count', 0) + getattr(self, 'cache_miss_count', 0)
+        hit_rate = getattr(self, 'cache_hit_count', 0) / max(1, total_requests)
+        
+        return {
+            "cache_enabled": True,
+            "cache_hit_count": getattr(self, 'cache_hit_count', 0),
+            "cache_miss_count": getattr(self, 'cache_miss_count', 0),
+            "hit_rate": hit_rate,
+            "cache_size": len(self.kv_cache_pool),
+            "cache_size_limit": getattr(self, 'cache_size_limit', 0)
+        }
+    
+    def clear_all_caches(self):
+        """清理所有缓存"""
+        if hasattr(self, 'kv_cache_pool'):
+            self.kv_cache_pool.clear()
+            self.cache_hit_count = 0
+            self.cache_miss_count = 0
+        
+        if hasattr(self, '_inference_cache'):
+            self._inference_cache.clear()
+        
+        # 清理内存管理器缓存
+        if hasattr(self, 'memory_manager') and self.memory_manager:
+            self.memory_manager.reset_stats() 

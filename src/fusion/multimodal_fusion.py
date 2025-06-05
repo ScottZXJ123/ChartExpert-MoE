@@ -153,26 +153,51 @@ class MultiModalFusion(nn.Module):
 
 
 class AttentionBasedFusion(nn.Module):
-    """Optimized attention-based fusion strategy with adaptive complexity"""
+    """Chart-aware optimized attention-based fusion strategy with adaptive complexity"""
     
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
         self.hidden_size = config.get("hidden_size", 768)
+        self.num_heads = config.get("num_heads", 8)
+        self.head_dim = self.hidden_size // self.num_heads
+        
+        # Chart-aware attention patterns
+        self.chart_attention_patterns = {
+            'bar_chart': self._create_grid_attention_mask,
+            'line_chart': self._create_sequential_attention_mask,
+            'pie_chart': self._create_radial_attention_mask,
+            'scatter_plot': self._create_local_attention_mask,
+            'heatmap': self._create_block_attention_mask
+        }
+        
+        # Flash Attention support
+        self.use_flash_attn = config.get("use_flash_attention", True)
+        try:
+            if self.use_flash_attn:
+                from flash_attn import flash_attn_func
+                self.flash_attn_func = flash_attn_func
+        except ImportError:
+            self.use_flash_attn = False
+            self.flash_attn_func = None
         
         # Traditional attention components
-        self.visual_attention = nn.MultiheadAttention(
-            embed_dim=self.hidden_size,
-            num_heads=config.get("num_heads", 8),
-            batch_first=True
-        )
+        self.visual_attention = self._create_chart_aware_attention()
         
         self.text_attention = nn.MultiheadAttention(
             embed_dim=self.hidden_size,
-            num_heads=config.get("num_heads", 8),
+            num_heads=self.num_heads,
             batch_first=True
         )
         
         self.fusion_projection = nn.Linear(self.hidden_size * 2, self.hidden_size)
+        
+        # Chart-type classifier for dynamic attention patterns
+        self.chart_type_classifier = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(self.hidden_size // 2, 5),  # 5 chart types
+            nn.Softmax(dim=-1)
+        )
         
         # Adaptive fusion components
         self.complexity_estimator = nn.Linear(self.hidden_size * 2, 1)
@@ -195,6 +220,268 @@ class AttentionBasedFusion(nn.Module):
             nn.GELU(),
             nn.Conv1d(self.hidden_size, self.hidden_size, kernel_size=1)
         )
+    
+    def _create_chart_aware_attention(self):
+        """Create chart-aware attention module"""
+        return ChartAwareAttention(self.hidden_size, self.num_heads)
+    
+    def _create_grid_attention_mask(self, seq_len: int, key_regions: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Create grid-based attention bias for bar charts"""
+        # Create attention bias that favors grid-aligned elements
+        mask = torch.zeros(seq_len, seq_len)
+        
+        # Encourage attention between elements in same row/column
+        grid_size = int(seq_len ** 0.5)
+        for i in range(seq_len):
+            row, col = i // grid_size, i % grid_size
+            # Same row attention
+            for j in range(row * grid_size, (row + 1) * grid_size):
+                if j < seq_len:
+                    mask[i, j] = 0.1
+            # Same column attention  
+            for j in range(col, seq_len, grid_size):
+                mask[i, j] = 0.1
+        
+        return mask
+    
+    def _create_sequential_attention_mask(self, seq_len: int, key_regions: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Create sequential attention bias for line charts"""
+        # Encourage attention to neighboring elements and trends
+        mask = torch.zeros(seq_len, seq_len)
+        
+        for i in range(seq_len):
+            # Local neighborhood attention
+            for j in range(max(0, i-3), min(seq_len, i+4)):
+                distance = abs(i - j)
+                mask[i, j] = 0.2 / (distance + 1)
+        
+        return mask
+    
+    def _create_radial_attention_mask(self, seq_len: int, key_regions: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Create radial attention bias for pie charts"""
+        # Encourage attention to center and adjacent sectors
+        mask = torch.zeros(seq_len, seq_len)
+        center_idx = seq_len // 2
+        
+        for i in range(seq_len):
+            # Attention to center
+            mask[i, center_idx] = 0.2
+            # Attention to adjacent elements (circular)
+            left = (i - 1) % seq_len
+            right = (i + 1) % seq_len
+            mask[i, left] = 0.1
+            mask[i, right] = 0.1
+        
+        return mask
+    
+    def _create_local_attention_mask(self, seq_len: int, key_regions: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Create local attention bias for scatter plots"""
+        # Encourage local clustering attention
+        mask = torch.zeros(seq_len, seq_len)
+        
+        # Create local attention windows
+        window_size = max(3, seq_len // 10)
+        for i in range(seq_len):
+            start = max(0, i - window_size)
+            end = min(seq_len, i + window_size + 1)
+            for j in range(start, end):
+                distance = abs(i - j)
+                mask[i, j] = 0.15 / (distance + 1)
+        
+        return mask
+    
+    def _create_block_attention_mask(self, seq_len: int, key_regions: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Create block attention bias for heatmaps"""
+        # Encourage block-wise attention patterns
+        mask = torch.zeros(seq_len, seq_len)
+        
+        block_size = max(4, seq_len // 8)
+        for i in range(seq_len):
+            block_start = (i // block_size) * block_size
+            block_end = min(seq_len, block_start + block_size)
+            for j in range(block_start, block_end):
+                mask[i, j] = 0.1
+        
+        return mask
+
+
+class ChartAwareAttention(nn.Module):
+    """Chart-aware attention mechanism with Flash Attention optimization"""
+    
+    def __init__(self, hidden_size: int, num_heads: int):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        
+        self.q_proj = nn.Linear(hidden_size, hidden_size)
+        self.k_proj = nn.Linear(hidden_size, hidden_size)
+        self.v_proj = nn.Linear(hidden_size, hidden_size)
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
+        
+        # Chart pattern detection
+        self.pattern_detector = nn.Linear(hidden_size, 5)  # 5 chart types
+        
+        # Flash Attention support
+        try:
+            from flash_attn import flash_attn_func
+            self.flash_attn_func = flash_attn_func
+            self.use_flash_attn = True
+        except ImportError:
+            self.flash_attn_func = None
+            self.use_flash_attn = False
+    
+    def forward(
+        self, 
+        query: torch.Tensor, 
+        key: torch.Tensor, 
+        value: torch.Tensor, 
+        chart_type: Optional[str] = None,
+        key_regions: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Chart-aware attention forward pass
+        
+        Args:
+            query: Query tensor [batch_size, seq_len, hidden_size]
+            key: Key tensor [batch_size, seq_len, hidden_size]  
+            value: Value tensor [batch_size, seq_len, hidden_size]
+            chart_type: Chart type hint
+            key_regions: Important regions in the chart
+            key_padding_mask: Padding mask
+            
+        Returns:
+            Attention output and weights
+        """
+        batch_size, seq_len = query.shape[:2]
+        
+        # Project to q, k, v
+        q = self.q_proj(query)
+        k = self.k_proj(key)
+        v = self.v_proj(value)
+        
+        # Reshape for multi-head attention
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        if self.use_flash_attn and query.is_cuda:
+            # Use Flash Attention for efficiency
+            if chart_type and hasattr(self, '_get_chart_bias'):
+                attention_bias = self._get_chart_bias(chart_type, seq_len, query.device)
+                attn_output = self.flash_attn_func(q, k, v, bias=attention_bias)
+            else:
+                attn_output = self.flash_attn_func(q, k, v)
+            
+            # No attention weights returned from Flash Attention
+            attn_weights = None
+        else:
+            # Standard attention with chart-specific patterns
+            scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+            
+            # Apply chart-specific attention bias
+            if chart_type:
+                chart_bias = self._get_chart_bias(chart_type, seq_len, query.device)
+                if chart_bias is not None:
+                    scores = scores + chart_bias.unsqueeze(0).unsqueeze(0)  # Broadcast for batch and heads
+            
+            # Apply padding mask
+            if key_padding_mask is not None:
+                scores = scores.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+            
+            attn_weights = F.softmax(scores, dim=-1)
+            attn_output = torch.matmul(attn_weights, v)
+        
+        # Reshape and project output
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
+        output = self.out_proj(attn_output)
+        
+        return output, attn_weights
+    
+    def _get_chart_bias(self, chart_type: str, seq_len: int, device: torch.device) -> Optional[torch.Tensor]:
+        """Get attention bias for specific chart type"""
+        if chart_type == 'bar_chart':
+            return self._create_grid_bias(seq_len, device)
+        elif chart_type == 'line_chart':
+            return self._create_sequential_bias(seq_len, device)
+        elif chart_type == 'pie_chart':
+            return self._create_radial_bias(seq_len, device)
+        elif chart_type == 'scatter_plot':
+            return self._create_local_bias(seq_len, device)
+        elif chart_type == 'heatmap':
+            return self._create_block_bias(seq_len, device)
+        else:
+            return None
+    
+    def _create_grid_bias(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """Grid attention bias for bar charts"""
+        bias = torch.zeros(seq_len, seq_len, device=device)
+        grid_size = int(seq_len ** 0.5)
+        
+        for i in range(seq_len):
+            row, col = i // grid_size, i % grid_size
+            # Same row/column elements get positive bias
+            for j in range(row * grid_size, (row + 1) * grid_size):
+                if j < seq_len:
+                    bias[i, j] = 0.1
+            for j in range(col, seq_len, grid_size):
+                bias[i, j] = 0.1
+        
+        return bias
+    
+    def _create_sequential_bias(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """Sequential attention bias for line charts"""
+        bias = torch.zeros(seq_len, seq_len, device=device)
+        
+        for i in range(seq_len):
+            for j in range(max(0, i-2), min(seq_len, i+3)):
+                distance = abs(i - j) 
+                bias[i, j] = 0.2 / (distance + 1)
+        
+        return bias
+    
+    def _create_radial_bias(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """Radial attention bias for pie charts"""
+        bias = torch.zeros(seq_len, seq_len, device=device)
+        center_idx = seq_len // 2
+        
+        for i in range(seq_len):
+            bias[i, center_idx] = 0.2  # Center attention
+            # Adjacent sectors
+            left = (i - 1) % seq_len
+            right = (i + 1) % seq_len
+            bias[i, left] = 0.1
+            bias[i, right] = 0.1
+        
+        return bias
+    
+    def _create_local_bias(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """Local attention bias for scatter plots"""
+        bias = torch.zeros(seq_len, seq_len, device=device)
+        window = max(3, seq_len // 10)
+        
+        for i in range(seq_len):
+            start = max(0, i - window)
+            end = min(seq_len, i + window + 1)
+            for j in range(start, end):
+                distance = abs(i - j)
+                bias[i, j] = 0.15 / (distance + 1)
+        
+        return bias
+    
+    def _create_block_bias(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """Block attention bias for heatmaps"""
+        bias = torch.zeros(seq_len, seq_len, device=device)
+        block_size = max(4, seq_len // 8)
+        
+        for i in range(seq_len):
+            block_start = (i // block_size) * block_size
+            block_end = min(seq_len, block_start + block_size)
+            for j in range(block_start, block_end):
+                bias[i, j] = 0.1
+        
+        return bias
     
     def forward(
         self,
