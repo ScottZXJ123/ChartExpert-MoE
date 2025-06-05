@@ -223,7 +223,13 @@ class ChartExpertMoE(nn.Module):
             zip(self.expert_levels, self.level_routers, num_experts_per_level)
         ):
             # Route to selected experts at this level
-            routing_weights = router(current_input.mean(dim=1))  # [batch_size, num_level_experts]
+            routing_output = router(
+                hidden_states=current_input.mean(dim=1),
+                image=image,
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )  # [batch_size, num_level_experts]
+            routing_weights = routing_output["routing_weights"]
             top_k_indices = torch.topk(routing_weights, k=min(num_experts, len(level_experts)), dim=-1).indices
             
             # Process with selected experts
@@ -296,6 +302,9 @@ class ChartExpertMoE(nn.Module):
         # Process each expert in parallel when possible
         expert_outputs = {}
         
+        # Flatten hidden states for expert processing [batch_size * seq_len, hidden_size]
+        flat_hidden_states = hidden_states.view(-1, hidden_size)
+        
         # Get unique expert indices across all samples in batch
         unique_experts = torch.unique(expert_indices).tolist()
         
@@ -307,9 +316,20 @@ class ChartExpertMoE(nn.Module):
             for idx, expert_id in enumerate(unique_experts):
                 stream = streams[idx % len(streams)]
                 with torch.cuda.stream(stream):
-                    expert_outputs[expert_id] = level_experts[expert_id](
-                        hidden_states, image, input_ids, attention_mask
+                    expert_result = level_experts[expert_id](
+                        hidden_states=flat_hidden_states, 
+                        image=image, 
+                        input_ids=input_ids, 
+                        attention_mask=attention_mask
                     )
+                    # Extract tensor from dictionary if needed
+                    if isinstance(expert_result, dict):
+                        expert_output_flat = expert_result.get("hidden_states", expert_result.get("output", flat_hidden_states))
+                    else:
+                        expert_output_flat = expert_result
+                    
+                    # Reshape back to 3D
+                    expert_outputs[expert_id] = expert_output_flat.view(batch_size, seq_len, hidden_size)
             
             # Synchronize all streams
             for stream in streams:
@@ -317,9 +337,20 @@ class ChartExpertMoE(nn.Module):
         else:
             # Sequential processing for CPU or single expert
             for expert_id in unique_experts:
-                expert_outputs[expert_id] = level_experts[expert_id](
-                    hidden_states, image, input_ids, attention_mask
+                expert_result = level_experts[expert_id](
+                    hidden_states=flat_hidden_states, 
+                    image=image, 
+                    input_ids=input_ids, 
+                    attention_mask=attention_mask
                 )
+                # Extract tensor from dictionary if needed
+                if isinstance(expert_result, dict):
+                    expert_output_flat = expert_result.get("hidden_states", expert_result.get("output", flat_hidden_states))
+                else:
+                    expert_output_flat = expert_result
+                
+                # Reshape back to 3D
+                expert_outputs[expert_id] = expert_output_flat.view(batch_size, seq_len, hidden_size)
         
         # Weighted combination of expert outputs
         for batch_idx in range(batch_size):
@@ -430,7 +461,13 @@ class ChartExpertMoE(nn.Module):
             # Create compatibility routing weights (average across levels)
             level_routing_weights = []
             for router in self.level_routers:
-                level_weights = router(fused_features.mean(dim=1))  # [batch_size, num_level_experts]
+                routing_output = router(
+                    hidden_states=fused_features.mean(dim=1),
+                    image=image,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
+                )  # [batch_size, num_level_experts]
+                level_weights = routing_output["routing_weights"]
                 # Pad to full expert count for compatibility
                 padded_weights = torch.zeros(level_weights.size(0), self.max_experts, device=level_weights.device)
                 padded_weights[:, :level_weights.size(1)] = level_weights

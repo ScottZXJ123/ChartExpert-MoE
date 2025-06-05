@@ -193,7 +193,7 @@ class AttentionBasedFusion(nn.Module):
         
         # Chart-type classifier for dynamic attention patterns
         self.chart_type_classifier = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size // 2),
+            nn.Linear(self.hidden_size * 2, self.hidden_size // 2),  # *2 because we concat visual+text
             nn.ReLU(),
             nn.Linear(self.hidden_size // 2, 5),  # 5 chart types
             nn.Softmax(dim=-1)
@@ -224,6 +224,66 @@ class AttentionBasedFusion(nn.Module):
     def _create_chart_aware_attention(self):
         """Create chart-aware attention module"""
         return ChartAwareAttention(self.hidden_size, self.num_heads)
+    
+    def forward(
+        self,
+        visual_features: torch.Tensor,
+        text_features: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs
+    ) -> torch.Tensor:
+        """
+        Apply attention-based fusion with chart-aware optimizations
+        
+        Args:
+            visual_features: Visual features [batch_size, num_patches, hidden_size]
+            text_features: Text features [batch_size, seq_len, hidden_size]
+            attention_mask: Attention mask for text [batch_size, seq_len]
+            
+        Returns:
+            Fused features [batch_size, total_seq_len, hidden_size]
+        """
+        batch_size = visual_features.size(0)
+        visual_seq_len = visual_features.size(1)
+        text_seq_len = text_features.size(1)
+        
+        # Detect chart type for dynamic attention patterns
+        combined_features = torch.cat([
+            visual_features.mean(dim=1),  # Global visual representation
+            text_features.mean(dim=1)     # Global text representation
+        ], dim=-1)
+        
+        chart_type_probs = self.chart_type_classifier(combined_features)
+        chart_type = ['bar_chart', 'line_chart', 'pie_chart', 'scatter_plot', 'heatmap'][
+            torch.argmax(chart_type_probs, dim=-1)[0].item()
+        ]
+        
+        # Apply chart-aware visual attention
+        visual_attended, _ = self.visual_attention(
+            query=visual_features,
+            key=visual_features,
+            value=visual_features,
+            chart_type=chart_type,
+            key_padding_mask=None
+        )
+        
+        # Apply text self-attention
+        if attention_mask is not None:
+            text_mask = attention_mask == 0
+        else:
+            text_mask = None
+            
+        text_attended, _ = self.text_attention(
+            query=text_features,
+            key=text_features,
+            value=text_features,
+            key_padding_mask=text_mask
+        )
+        
+        # Combine visual and text sequences along sequence dimension
+        combined_sequence = torch.cat([visual_attended, text_attended], dim=1)
+        
+        return combined_sequence
     
     def _create_grid_attention_mask(self, seq_len: int, key_regions: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Create grid-based attention bias for bar charts"""
@@ -482,6 +542,36 @@ class ChartAwareAttention(nn.Module):
                 bias[i, j] = 0.1
         
         return bias
+
+
+class AdaptiveAttentionFusion(nn.Module):
+    """Adaptive attention-based fusion with efficiency optimizations"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__()
+        self.hidden_size = config.get("hidden_size", 768)
+        self.num_heads = config.get("num_heads", 12)
+        
+        # Simple fusion for low complexity
+        self.simple_fusion_projection = nn.Linear(self.hidden_size * 2, self.hidden_size)
+        
+        # Lightweight attention components
+        self.reduction_layer = nn.Linear(self.hidden_size, self.hidden_size // 4)
+        self.lightweight_query_proj = nn.Linear(self.hidden_size // 4, self.hidden_size // 4)
+        self.lightweight_kv_proj = nn.Linear(self.hidden_size // 4, self.hidden_size // 4)
+        self.lightweight_fusion_proj = nn.Linear(self.hidden_size + self.hidden_size // 4, self.hidden_size)
+        
+        # Sparse attention components
+        self.sparse_query_proj = nn.Linear(self.hidden_size, self.hidden_size)
+        self.sparse_key_proj = nn.Linear(self.hidden_size, self.hidden_size)
+        self.sparse_value_proj = nn.Linear(self.hidden_size, self.hidden_size)
+        
+        # Efficient fusion using grouped convolution
+        self.efficient_fusion_layers = nn.Sequential(
+            nn.Conv1d(self.hidden_size, self.hidden_size, kernel_size=3, padding=1, groups=self.hidden_size // 64),
+            nn.GELU(),
+            nn.Conv1d(self.hidden_size, self.hidden_size, kernel_size=1)
+        )
     
     def forward(
         self,

@@ -1,0 +1,80 @@
+{
+  "timestamp": 1749162995.3578002,
+  "device": "cuda",
+  "hierarchical_experts": {
+    "enabled": true,
+    "levels": 3,
+    "experts_per_level": [
+      3,
+      4,
+      5
+    ]
+  },
+  "chart_aware_attention": {
+    "working": true,
+    "flash_attention": false,
+    "supported_charts": [
+      "bar_chart",
+      "line_chart",
+      "pie_chart",
+      "scatter_plot",
+      "heatmap"
+    ]
+  },
+  "memory_management": {
+    "adaptive_loading": true,
+    "loaded_experts": 4,
+    "memory_stats": {
+      "active_experts": 4,
+      "max_gpu_experts": 4,
+      "total_loads": 5,
+      "total_offloads": 1,
+      "memory_saves": 1,
+      "expert_usage_count": {},
+      "cache_efficiency": 0.16666666666666666,
+      "gpu_memory_allocated": 5713211904,
+      "gpu_memory_reserved": 5825888256,
+      "gpu_memory_max": 5715574272,
+      "system_memory_used": 16556048384,
+      "system_memory_available": 2121837838336,
+      "system_memory_percent": 1.4
+    }
+  },
+  "inference_optimizations": {
+    "smart_inference": true,
+    "early_exit_available": true,
+    "kv_cache_available": true,
+    "smart_time": 0.7511885166168213,
+    "standard_time": 0.13160490989685059,
+    "speedup": 0.17519558271413485
+  },
+  "performance": {
+    "memory_usage_gb": 0.0009784698486328125,
+    "efficiency_grade": "A",
+    "throughput_samples_per_sec": 8090.864197530864,
+    "avg_inference_time": 0.0002471923828125
+  },
+  "optimization_stats": {
+    "model_type": "ChartExpert-MoE",
+    "optimizations_enabled": [
+      "hierarchical_experts",
+      "kv_cache",
+      "early_exit"
+    ],
+    "expert_levels": 3,
+    "experts_per_level": [
+      3,
+      4,
+      5
+    ],
+    "cache_stats": {
+      "cache_enabled": true,
+      "cache_hit_count": 6,
+      "cache_miss_count": 1,
+      "hit_rate": 0.8571428571428571,
+      "cache_size": 1,
+      "cache_size_limit": 1073741824
+    },
+    "early_exit_layers": 3
+  }
+}

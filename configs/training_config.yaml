@@ -1,0 +1,219 @@
+# ChartExpert-MoE Training Configuration
+
+# Model Configuration
+model:
+  hidden_size: 768
+  vocab_size: 50257  # GPT-2 vocabulary
+  num_heads: 12
+  use_hierarchical_experts: true
+  use_flash_attention: true
+  simple_confidence_threshold: 0.95
+  medium_confidence_threshold: 0.90
+  complex_confidence_threshold: 0.85
+  num_early_exit_layers: 3
+  kv_cache_size_limit: 1073741824  # 1GB
+  min_experts: 1
+  aux_loss_weight: 0.01
+  gradient_clip_norm: 1.0
+
+# Vision Encoder Configuration
+vision_encoder:
+  encoder_type: "clip"  # or "dinov2", "moonvit", "sam"
+  model_name: "openai/clip-vit-base-patch32"
+  hidden_size: 768
+  use_native_resolution: false
+  use_2d_rope: true
+  max_resolution: 1024
+  patch_size: 32
+  max_patches: 196
+
+# LLM Backbone Configuration  
+llm_backbone:
+  model_name: "microsoft/DialoGPT-medium"
+  hidden_size: 1024
+  vocab_size: 50257
+  use_mock: false  # Set to true if you want to use mock models for testing
+
+# Multimodal Fusion Configuration
+fusion:
+  hidden_size: 768
+  num_heads: 12
+  fusion_type: "attention"  # or "concat", "add"
+  dropout: 0.1
+
+# Routing Configuration
+routing:
+  hidden_size: 768
+  num_experts: 12
+  top_k: 2
+  dropout: 0.1
+  load_balancing_weight: 0.01
+
+# MoE Configuration
+moe:
+  hidden_size: 768
+  num_experts: 12
+  top_k: 2
+  capacity_factor: 1.25
+  dropout: 0.1
+
+# Expert Configurations
+experts:
+  layout:
+    hidden_size: 768
+  ocr:
+    hidden_size: 768
+  scale:
+    hidden_size: 768
+  geometric:
+    hidden_size: 768
+  trend:
+    hidden_size: 768
+  query:
+    hidden_size: 768
+  numerical:
+    hidden_size: 768
+  integration:
+    hidden_size: 768
+  alignment:
+    hidden_size: 768
+  chart_to_graph:
+    hidden_size: 768
+  shallow_reasoning:
+    hidden_size: 768
+  orchestrator:
+    hidden_size: 768
+
+# Data Configuration
+data:
+  max_length: 512
+  image_size: [224, 224]
+  batch_size: 8
+  num_workers: 4
+  cache_dir: "./data_cache"
+  
+  # Dataset configurations
+  datasets:
+    chartqa:
+      enabled: true
+      splits: ["train", "val", "test"]
+    plotqa:
+      enabled: false  # Disable if not available
+      data_dir: "./data/plotqa"
+    chartmuseum:
+      enabled: false  # Disable due to loading issues
+    
+# Training Configuration
+training:
+  # Global training settings
+  num_epochs: 10
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  warmup_steps: 1000
+  gradient_accumulation_steps: 4
+  log_interval: 100
+  eval_interval: 1000
+  save_interval: 2000
+  max_grad_norm: 1.0
+  
+  # Mixed precision training
+  use_fp16: true
+  
+  # Optimizer settings
+  optimizer:
+    type: "adamw"
+    lr: 1e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    eps: 1e-8
+  
+  # Scheduler settings
+  scheduler:
+    type: "cosine"
+    num_warmup_steps: 1000
+    num_training_steps: 50000
+  
+  # Multi-stage training configuration
+  stages:
+    foundation:
+      description: "Foundation pre-training on general vision-language data"
+      epochs: 2
+      learning_rate: 1e-4
+      freeze_vision_encoder: false
+      freeze_llm_backbone: false
+      freeze_experts: false
+      datasets: ["general_vl"]  # Placeholder
+      
+    joint_pretrain:
+      description: "Joint pre-training on chart data"
+      epochs: 3
+      learning_rate: 8e-5
+      freeze_vision_encoder: false
+      freeze_llm_backbone: false
+      freeze_experts: false
+      datasets: ["chartqa"]
+      
+    chart_tuning:
+      description: "Chart-specific fine-tuning"
+      epochs: 2
+      learning_rate: 5e-5
+      freeze_vision_encoder: true
+      freeze_llm_backbone: false
+      freeze_experts: false
+      datasets: ["chartqa"]
+      
+    expert_specialization:
+      description: "Expert specialization training"
+      epochs: 2
+      learning_rate: 3e-5
+      freeze_vision_encoder: true
+      freeze_llm_backbone: true
+      freeze_experts: false
+      datasets: ["chartqa"]
+      
+    chartmuseum_finetune:
+      description: "Final fine-tuning on ChartMuseum"
+      epochs: 1
+      learning_rate: 1e-5
+      freeze_vision_encoder: true
+      freeze_llm_backbone: false
+      freeze_experts: false
+      datasets: ["chartmuseum"]
+
+# Evaluation Configuration
+evaluation:
+  metrics: ["accuracy", "bleu", "rouge", "exact_match"]
+  eval_batch_size: 16
+  max_eval_samples: 1000
+  
+# Logging Configuration
+logging:
+  log_level: "INFO"
+  log_dir: "./logs"
+  
+  # Weights & Biases configuration
+  wandb:
+    enabled: true
+    project: "chartexpert-moe"
+    entity: "chart-reasoning"
+    tags: ["moe", "chart-understanding", "multimodal"]
+    
+# Hardware Configuration
+hardware:
+  use_gpu: true
+  distributed: false
+  device_map: "auto"
+  max_memory: "40GB"
+  
+# Checkpointing Configuration
+checkpointing:
+  save_best: true
+  save_last: true
+  save_interval: 2000
+  max_checkpoints_to_keep: 5
+  
+# Environment Configuration
+environment:
+  seed: 42
+  deterministic: true
+  benchmark: true 
