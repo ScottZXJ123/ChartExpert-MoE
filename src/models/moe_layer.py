@@ -92,7 +92,7 @@ class MoELayer(nn.Module):
         
         # Load balancing components
         if self.load_balancing:
-            self.expert_usage = torch.zeros(self.num_experts)
+            self.register_buffer('expert_usage', torch.zeros(self.num_experts))
             self.total_tokens = 0
     
     def forward(
@@ -139,30 +139,117 @@ class MoELayer(nn.Module):
         dispatch_mask = torch.zeros_like(routing_weights)
         dispatch_mask.scatter_(1, top_k_indices, top_k_gates)
         
-        # Compute expert outputs
+        # Optimized parallel expert processing
         expert_outputs = []
+        
+        # 1. Collect active experts and their tokens efficiently
+        active_experts = []
+        expert_token_batches = []
+        expert_indices_batches = []
+        
         for i, expert in enumerate(self.experts):
-            # Get tokens assigned to this expert
             expert_mask = dispatch_mask[:, i]  # [batch_size * seq_len]
-            expert_tokens = flat_hidden_states * expert_mask.unsqueeze(-1)  # [batch_size * seq_len, hidden_size]
+            active_indices = torch.nonzero(expert_mask, as_tuple=True)[0]
             
-            # Process through expert
-            if torch.sum(expert_mask) > 0:  # Only process if tokens are assigned
-                expert_output = expert(
-                    hidden_states=expert_tokens,
-                    image=image,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    routing_weights=expert_mask
-                )
+            if len(active_indices) > 0:
+                # Extract only active tokens (sparse computation)
+                expert_tokens = flat_hidden_states[active_indices]  # [num_active_tokens, hidden_size]
+                expert_weights = expert_mask[active_indices]
                 
-                if isinstance(expert_output, dict):
-                    expert_output = expert_output.get("hidden_states", expert_tokens)
+                active_experts.append((i, expert))
+                expert_token_batches.append(expert_tokens)
+                expert_indices_batches.append(active_indices)
+        
+        # 2. Process experts in parallel when we have GPU resources
+        if active_experts and len(active_experts) > 1:
+            # Parallel processing using CUDA streams for GPU efficiency
+            expert_results = {}
+            
+            if torch.cuda.is_available() and len(active_experts) <= 4:  # Limit streams
+                # Use CUDA streams for true parallelism
+                streams = [torch.cuda.Stream() for _ in range(min(len(active_experts), 4))]
+                stream_futures = []
                 
-                expert_outputs.append(expert_output)
+                for idx, (expert_idx, expert) in enumerate(active_experts):
+                    stream = streams[idx % len(streams)]
+                    tokens = expert_token_batches[idx]
+                    indices = expert_indices_batches[idx]
+                    
+                    with torch.cuda.stream(stream):
+                        expert_output = expert(
+                            hidden_states=tokens,
+                            image=image,
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            routing_weights=dispatch_mask[indices, expert_idx].unsqueeze(-1)
+                        )
+                        
+                        if isinstance(expert_output, dict):
+                            expert_output = expert_output.get("hidden_states", tokens)
+                        
+                        expert_results[expert_idx] = (expert_output, indices)
+                
+                # Synchronize all streams
+                for stream in streams:
+                    stream.synchronize()
             else:
-                # No tokens assigned to this expert
-                expert_outputs.append(torch.zeros_like(expert_tokens))
+                # Sequential fallback for CPU or too many experts
+                for idx, (expert_idx, expert) in enumerate(active_experts):
+                    tokens = expert_token_batches[idx]
+                    indices = expert_indices_batches[idx]
+                    
+                    expert_output = expert(
+                        hidden_states=tokens,
+                        image=image,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        routing_weights=dispatch_mask[indices, expert_idx].unsqueeze(-1)
+                    )
+                    
+                    if isinstance(expert_output, dict):
+                        expert_output = expert_output.get("hidden_states", tokens)
+                    
+                    expert_results[expert_idx] = (expert_output, indices)
+            
+            # 3. Reconstruct full expert outputs efficiently
+            expert_outputs = []
+            for i in range(self.num_experts):
+                if i in expert_results:
+                    output, indices = expert_results[i]
+                    # Create sparse output tensor
+                    full_output = torch.zeros_like(flat_hidden_states)
+                    full_output[indices] = output
+                    expert_outputs.append(full_output)
+                else:
+                    expert_outputs.append(torch.zeros_like(flat_hidden_states))
+                    
+        else:
+            # Handle single expert or no active experts
+            expert_outputs = []
+            for i, expert in enumerate(self.experts):
+                expert_mask = dispatch_mask[:, i]
+                
+                if torch.sum(expert_mask) > 0:
+                    active_indices = torch.nonzero(expert_mask, as_tuple=True)[0]
+                    expert_tokens = flat_hidden_states[active_indices]
+                    
+                    expert_output = expert(
+                        hidden_states=expert_tokens,
+                        image=image,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        routing_weights=expert_mask[active_indices].unsqueeze(-1)
+                    )
+                    
+                    if isinstance(expert_output, dict):
+                        expert_output = expert_output.get("hidden_states", expert_tokens)
+                    
+                    # Reconstruct full output
+                    full_output = torch.zeros_like(flat_hidden_states)
+                    full_output[active_indices] = expert_output
+                    expert_outputs.append(full_output)
+                else:
+                    expert_outputs.append(torch.zeros_like(flat_hidden_states))
         
         # Combine expert outputs
         combined_output = torch.zeros_like(flat_hidden_states)
@@ -235,7 +322,7 @@ class MoELayer(nn.Module):
     
     def reset_usage_stats(self):
         """Reset expert usage statistics"""
-        self.expert_usage = torch.zeros(self.num_experts)
+        self.expert_usage.zero_()
         self.total_tokens = 0
 
     def _add_noise_to_gates(self, gates: torch.Tensor, training: bool = True) -> torch.Tensor:
@@ -278,7 +365,7 @@ class MoELayer(nn.Module):
         
         # Apply routing with priority
         capacity = self._compute_capacity(batch_size, seq_len)
-        expert_counts = torch.zeros(self.num_experts, device=hidden_states.device)
+        expert_counts = torch.zeros(self.num_experts, device=hidden_states.device, dtype=hidden_states.dtype)
         
         final_routing = torch.zeros_like(routing_flat)
         

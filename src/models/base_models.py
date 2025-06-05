@@ -90,7 +90,6 @@ class VisionEncoder(nn.Module):
         # Initialize encoder based on type
         if self.encoder_type == "clip":
             try:
-                from transformers import CLIPVisionModel
                 # Load without device map to avoid version issues
                 self.encoder = CLIPVisionModel.from_pretrained(
                     config["model_name"],
@@ -100,6 +99,10 @@ class VisionEncoder(nn.Module):
             except Exception as e:
                 print(f"Warning: Failed to load CLIP model: {e}")
                 print("Using mock encoder for testing")
+                self.encoder = self._create_mock_encoder()
+                self.encoder_hidden_size = 768
+            else:
+                print("Warning: CLIP not available, using mock encoder")
                 self.encoder = self._create_mock_encoder()
                 self.encoder_hidden_size = 768
         elif self.encoder_type == "dinov2":
@@ -136,6 +139,9 @@ class VisionEncoder(nn.Module):
         
         # Projection layer
         self.projection = nn.Linear(self.encoder_hidden_size, self.hidden_size)
+        
+        # Position embedding for spatial information
+        self.position_embedding = self._build_position_embedding(config)
         
         # 2D RoPE for better spatial understanding
         if self.use_2d_rope:
@@ -242,61 +248,125 @@ class VisionEncoder(nn.Module):
         max_patches = config.get("max_patches", 196)  # 14x14 for patch16 on 224x224
         return nn.Embedding(max_patches, self.hidden_size)
     
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
+    def forward(self, images: torch.Tensor, query_complexity: Optional[float] = None) -> torch.Tensor:
         """
-        Encode chart images
+        Hierarchical and adaptive visual encoding
         
         Args:
             images: Image tensor [batch_size, channels, height, width]
+            query_complexity: Optional complexity score for adaptive processing
             
         Returns:
             Visual features [batch_size, num_patches, hidden_size]
         """
         batch_size = images.size(0)
+        original_size = images.shape[-2:]
         
-        if self.encoder_type in ["clip", "siglip"]:
-            # For CLIP/SigLIP, check if it's a real model or mock
-            if hasattr(self.encoder, 'forward_features'):
-                visual_features = self.encoder.forward_features(images)
-            elif hasattr(self.encoder, 'vision_model'):
-                # Real CLIP model
-                outputs = self.encoder(pixel_values=images)
-                if hasattr(outputs, 'last_hidden_state'):
-                    visual_features = outputs.last_hidden_state
-                else:
-                    visual_features = outputs.pooler_output.unsqueeze(1)
-            else:
-                # Mock encoder
-                visual_features = self.encoder(images)
+        # 1. Quick complexity assessment using low-resolution version
+        if query_complexity is None:
+            query_complexity = self._estimate_visual_complexity(images)
+        
+        # 2. Adaptive resolution selection
+        if query_complexity < 0.3 and original_size[0] > 224:
+            # Low complexity: use lower resolution for speed
+            scale_factor = 224 / max(original_size)
+            images = F.interpolate(images, scale_factor=scale_factor, mode='bilinear', align_corners=False)
+            use_fast_path = True
+        elif query_complexity < 0.7 and original_size[0] > 336:
+            # Medium complexity: moderate resolution
+            scale_factor = 336 / max(original_size) 
+            images = F.interpolate(images, scale_factor=scale_factor, mode='bilinear', align_corners=False)
+            use_fast_path = False
         else:
-            # For other encoders (DINOv2, MoonViT, SAM, mock)
-            if hasattr(self.encoder, 'forward_features'):
-                visual_features = self.encoder.forward_features(images)
-            else:
-                # Direct forward for mock or custom encoders
-                visual_features = self.encoder(images)
+            # High complexity: full resolution
+            use_fast_path = False
+        
+        # 3. Encode with appropriate strategy
+        if self.encoder_type in ["clip", "siglip"]:
+            visual_features = self._encode_clip_style(images, use_fast_path)
+        else:
+            visual_features = self._encode_other(images, use_fast_path)
                 
         if len(visual_features.shape) == 2:
-            # Add sequence dimension if needed
             visual_features = visual_features.unsqueeze(1)
         
-        # Handle MoonViT output
         if isinstance(visual_features, tuple):
             visual_features = visual_features[0]
         
+        # 4. Efficient feature processing
+        visual_features = self._process_features_efficiently(visual_features, query_complexity)
+        
+        return visual_features
+    
+    def _estimate_visual_complexity(self, images: torch.Tensor) -> float:
+        """Quickly estimate visual complexity using downsampled image"""
+        # Downsample for quick analysis
+        small_img = F.interpolate(images, size=(56, 56), mode='bilinear')
+        
+        # Calculate complexity metrics
+        # 1. Edge density (indicates detail level)
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=images.device).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=images.device).view(1, 1, 3, 3)
+        
+        gray = small_img.mean(dim=1, keepdim=True)
+        edges_x = F.conv2d(gray, sobel_x, padding=1)
+        edges_y = F.conv2d(gray, sobel_y, padding=1)
+        edge_magnitude = torch.sqrt(edges_x**2 + edges_y**2)
+        edge_density = edge_magnitude.mean().item()
+        
+        # 2. Color variance (indicates chart complexity)
+        color_var = small_img.var(dim=[2, 3]).mean().item()
+        
+        # Combine metrics to get complexity score
+        complexity = min(1.0, (edge_density * 2 + color_var) / 2)
+        return complexity
+    
+    def _encode_clip_style(self, images: torch.Tensor, use_fast_path: bool) -> torch.Tensor:
+        """Encode using CLIP-style encoders with path optimization"""
+        if hasattr(self.encoder, 'forward_features') and not use_fast_path:
+            return self.encoder.forward_features(images)
+        elif hasattr(self.encoder, 'vision_model'):
+            # Real CLIP model with potential fast path
+            if use_fast_path and hasattr(self.encoder.vision_model, 'embeddings'):
+                # Skip some layers for fast processing
+                embeddings = self.encoder.vision_model.embeddings(images)
+                # Use only first half of encoder layers
+                encoder = self.encoder.vision_model.encoder
+                num_layers = len(encoder.layers)
+                for i in range(num_layers // 2):
+                    embeddings = encoder.layers[i](embeddings)[0]
+                return embeddings
+            else:
+                outputs = self.encoder(pixel_values=images)
+                if hasattr(outputs, 'last_hidden_state'):
+                    return outputs.last_hidden_state
+                else:
+                    return outputs.pooler_output.unsqueeze(1)
+        else:
+            # Mock encoder
+            return self.encoder(images)
+    
+    def _encode_other(self, images: torch.Tensor, use_fast_path: bool) -> torch.Tensor:
+        """Encode using other encoder types"""
+        if hasattr(self.encoder, 'forward_features') and not use_fast_path:
+            return self.encoder.forward_features(images)
+        else:
+            return self.encoder(images)
+    
+    def _process_features_efficiently(self, visual_features: torch.Tensor, complexity: float) -> torch.Tensor:
+        """Efficiently process visual features based on complexity"""
         # Project to target hidden size
         visual_features = self.projection(visual_features)
         
-        # Add position embeddings if needed
-        if hasattr(self, 'position_embedding'):
+        # Conditional position embedding (skip for simple cases)
+        if hasattr(self, 'position_embedding') and complexity > 0.3:
             seq_len = visual_features.size(1)
             position_ids = torch.arange(seq_len, device=visual_features.device)
             position_embeddings = self.position_embedding(position_ids)
             visual_features = visual_features + position_embeddings.unsqueeze(0)
         
-        # Apply 2D RoPE if enabled
-        if self.use_2d_rope and visual_features.size(1) > 1:
-            # Assume square patches
+        # Apply 2D RoPE only for complex visual content
+        if self.use_2d_rope and visual_features.size(1) > 1 and complexity > 0.5:
             num_patches = visual_features.size(1)
             height = width = int(math.sqrt(num_patches))
             visual_features = self.rope_2d(visual_features, height, width)
@@ -317,7 +387,8 @@ class VisionEncoder(nn.Module):
                 features.size(0),
                 target_len - current_len,
                 features.size(2),
-                device=features.device
+                device=features.device,
+                dtype=features.dtype
             )
             return torch.cat([features, padding], dim=1)
     

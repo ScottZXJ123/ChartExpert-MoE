@@ -20,7 +20,10 @@ from tqdm import tqdm
 import logging
 from typing import Dict, Any, Optional
 
-# Import from the installed package
+# Add src to path for imports
+sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
+
+# Import from source
 from models import ChartExpertMoE
 from data import ChartMuseumDataset, ChartQADataset, MultiDatasetLoader
 from training import MultiStageTrainer

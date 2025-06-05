@@ -59,7 +59,7 @@ class DynamicRouter(nn.Module):
         # Load balancing
         self.load_balancing = config.get("load_balancing", True)
         if self.load_balancing:
-            self.expert_usage = torch.zeros(self.num_experts)
+            self.register_buffer('expert_usage', torch.zeros(self.num_experts))
             self.balance_weight = config.get("balance_weight", 0.01)
     
     def _define_task_patterns(self) -> Dict[str, List[int]]:

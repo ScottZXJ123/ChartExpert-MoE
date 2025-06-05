@@ -61,7 +61,12 @@ class LayoutDetectionExpert(BaseExpert):
     def _build_visual_encoder(self, config: Dict[str, Any]) -> nn.Module:
         """Build visual encoder for layout detection"""
         # Use pretrained ResNet as visual backbone
-        backbone = resnet50(weights='IMAGENET1K_V1')  # Updated to use weights parameter
+        try:
+            # Try newer torchvision API
+            backbone = resnet50(weights='IMAGENET1K_V1')
+        except TypeError:
+            # Fall back to older API
+            backbone = resnet50(pretrained=True)
         # Remove final classification layer
         backbone = nn.Sequential(*list(backbone.children())[:-2])
         
@@ -346,13 +351,21 @@ class ScaleInterpretationExpert(BaseExpert):
         if flat_batch_size > actual_batch_size:
             tokens_per_batch = flat_batch_size // actual_batch_size
             if flat_batch_size % actual_batch_size != 0:
-                pass # Or log a warning
-            expanded_features = mock_features_per_image.unsqueeze(1).repeat(1, tokens_per_batch, 1)
-            final_features = expanded_features.reshape(flat_batch_size, self.num_scale_features)
+                # Handle remainder by padding with zeros
+                remainder = flat_batch_size % actual_batch_size
+                padded_features = torch.cat([
+                    mock_features_per_image,
+                    torch.zeros(remainder, self.num_scale_features, device=device)
+                ], dim=0)
+                expanded_features = padded_features.unsqueeze(1).repeat(1, max(1, tokens_per_batch), 1)
+                final_features = expanded_features.reshape(-1, self.num_scale_features)[:flat_batch_size]
+            else:
+                expanded_features = mock_features_per_image.unsqueeze(1).repeat(1, tokens_per_batch, 1)
+                final_features = expanded_features.reshape(flat_batch_size, self.num_scale_features)
         elif flat_batch_size == actual_batch_size:
             final_features = mock_features_per_image
         else: # flat_batch_size < actual_batch_size
-            final_features = torch.zeros(flat_batch_size, self.num_scale_features, device=device)
+            final_features = mock_features_per_image[:flat_batch_size]
         
         return final_features
     

@@ -6,6 +6,109 @@ import torch
 import torch.nn as nn
 from typing import Dict, Optional, Any, Tuple
 from abc import ABC, abstractmethod
+from collections import defaultdict
+
+
+class SharedExpertBackbone(nn.Module):
+    """共享专家骨干网络，减少重复计算"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__()
+        self.hidden_size = config.get("hidden_size", 768)
+        
+        # 共享的特征提取器 - 所有专家共用
+        self.shared_encoder = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size * 2),
+            nn.GELU(),
+            nn.Dropout(config.get("dropout_rate", 0.1)),
+            nn.Linear(self.hidden_size * 2, self.hidden_size),
+            nn.LayerNorm(self.hidden_size)
+        )
+        
+        # 共享的注意力机制
+        self.shared_attention = nn.MultiheadAttention(
+            embed_dim=self.hidden_size,
+            num_heads=8,
+            batch_first=True,
+            dropout=config.get("dropout_rate", 0.1)
+        )
+        
+        # 缓存机制
+        self._feature_cache = {}
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self.max_cache_size = config.get("max_cache_size", 100)
+    
+    def forward(self, hidden_states: torch.Tensor, use_cache: bool = True) -> torch.Tensor:
+        """
+        共享特征提取
+        
+        Args:
+            hidden_states: 输入特征 [batch_size * seq_len, hidden_size]
+            use_cache: 是否使用缓存
+            
+        Returns:
+            共享特征 [batch_size * seq_len, hidden_size]
+        """
+        # 生成缓存键
+        if use_cache and self.training is False:  # 只在推理时缓存
+            cache_key = self._generate_cache_key(hidden_states)
+            if cache_key in self._feature_cache:
+                self._cache_hits += 1
+                return self._feature_cache[cache_key]
+            self._cache_misses += 1
+        
+        # 共享编码
+        shared_features = self.shared_encoder(hidden_states)
+        
+        # 共享自注意力（如果序列足够长）
+        if hidden_states.size(0) > 1:
+            # 重塑为序列格式进行注意力计算
+            seq_len = min(int(hidden_states.size(0) ** 0.5), 32)  # 限制序列长度
+            if seq_len > 1:
+                batch_size = hidden_states.size(0) // seq_len
+                if batch_size * seq_len == hidden_states.size(0):
+                    seq_features = shared_features[:batch_size * seq_len].view(batch_size, seq_len, self.hidden_size)
+                    attended_features, _ = self.shared_attention(seq_features, seq_features, seq_features)
+                    shared_features[:batch_size * seq_len] = attended_features.view(-1, self.hidden_size)
+        
+        # 缓存结果
+        if use_cache and self.training is False:
+            # 限制缓存大小
+            if len(self._feature_cache) >= self.max_cache_size:
+                oldest_key = next(iter(self._feature_cache))
+                del self._feature_cache[oldest_key]
+            self._feature_cache[cache_key] = shared_features.detach().clone()
+        
+        return shared_features
+    
+    def _generate_cache_key(self, tensor: torch.Tensor) -> str:
+        """生成张量的缓存键"""
+        # 使用张量的统计信息和形状作为键
+        with torch.no_grad():
+            mean_val = tensor.mean().item()
+            std_val = tensor.std().item()
+            shape_str = "_".join(map(str, tensor.shape))
+            device_str = str(tensor.device)
+            return f"{mean_val:.4f}_{std_val:.4f}_{shape_str}_{device_str}"
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """获取缓存统计信息"""
+        total_requests = self._cache_hits + self._cache_misses
+        hit_rate = self._cache_hits / total_requests if total_requests > 0 else 0
+        return {
+            "cache_hits": self._cache_hits,
+            "cache_misses": self._cache_misses,
+            "hit_rate": hit_rate,
+            "cache_size": len(self._feature_cache),
+            "max_cache_size": self.max_cache_size
+        }
+    
+    def clear_cache(self):
+        """清空缓存"""
+        self._feature_cache.clear()
+        self._cache_hits = 0
+        self._cache_misses = 0
 
 
 class BaseExpert(nn.Module, ABC):
@@ -97,6 +200,20 @@ class BaseExpert(nn.Module, ABC):
         Returns:
             Dictionary containing processed hidden states and metadata
         """
+        # Input validation
+        if not isinstance(hidden_states, torch.Tensor):
+            raise TypeError(f"hidden_states must be a torch.Tensor, got {type(hidden_states)}")
+        
+        if hidden_states.dim() != 2:
+            raise ValueError(f"hidden_states must be 2D tensor [batch_size * seq_len, hidden_size], got shape {hidden_states.shape}")
+        
+        if hidden_states.size(-1) != self.hidden_size:
+            raise ValueError(f"hidden_states last dimension must be {self.hidden_size}, got {hidden_states.size(-1)}")
+        
+        # Check for NaN or Inf values
+        if torch.isnan(hidden_states).any() or torch.isinf(hidden_states).any():
+            raise ValueError("hidden_states contains NaN or Inf values")
+        
         # Track activation
         self.activation_count += 1
         if routing_weights is not None:
