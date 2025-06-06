@@ -194,7 +194,7 @@ class RealModelMoE(nn.Module):
                 self.backbone = AutoModel.from_pretrained(
                     backbone_name,
                     trust_remote_code=True,
-                    torch_dtype=torch.float16,  # Use half precision to save memory
+                    torch_dtype=torch.float32,  # Use float32 to avoid precision issues
                     low_cpu_mem_usage=True,
                     device_map=None  # Load to CPU first, then move to GPU
                 )
@@ -203,7 +203,7 @@ class RealModelMoE(nn.Module):
                 print("🔄 Loading generic model...")
                 self.backbone = AutoModel.from_pretrained(
                     backbone_name,
-                    torch_dtype=torch.float16,
+                    torch_dtype=torch.float32,  # Use float32 to avoid precision issues
                     low_cpu_mem_usage=True
                 )
                 self.use_vision = False
@@ -325,10 +325,13 @@ class RealModelMoE(nn.Module):
                     text_pooled = text_features.mean(1)
             else:
                 # Fallback: create dummy features
-                text_pooled = torch.randn(batch_size, self.hidden_size, device=device, dtype=torch.float16)
+                text_pooled = torch.randn(batch_size, self.hidden_size, device=device, dtype=torch.float32)
             
             # Process image for non-VL models (more memory efficient)
             if not self.use_vision and hasattr(self, 'image_encoder'):
+                # Ensure image is float32
+                image = image.float()
+                
                 # Process image in chunks if batch is too large
                 if batch_size > 4:
                     image_features_list = []
@@ -389,12 +392,16 @@ class RealModelMoE(nn.Module):
             if labels is not None:
                 loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
                 
+                # Ensure consistent data types for loss calculation
+                logits_for_loss = logits.float()
+                labels_for_loss = labels.long()
+                
                 # Simple token-level loss
-                if labels.dim() > 1 and labels.size(1) > 1:
+                if labels_for_loss.dim() > 1 and labels_for_loss.size(1) > 1:
                     # Take the first valid token
-                    loss = loss_fct(logits, labels[:, 0])
+                    loss = loss_fct(logits_for_loss, labels_for_loss[:, 0])
                 else:
-                    loss = loss_fct(logits, labels.squeeze())
+                    loss = loss_fct(logits_for_loss, labels_for_loss.squeeze())
                 
                 # Add small diversity loss
                 router_entropy = -torch.sum(router_weights * torch.log(router_weights + 1e-8), dim=-1)
@@ -410,7 +417,7 @@ class RealModelMoE(nn.Module):
         except Exception as e:
             print(f"🚨 Forward pass error: {e}")
             # Safe fallback
-            dummy_logits = torch.randn(batch_size, self.config["vocab_size"], device=device, dtype=torch.float16) * 0.01
+            dummy_logits = torch.randn(batch_size, self.config["vocab_size"], device=device, dtype=torch.float32) * 0.01
             dummy_loss = torch.tensor(1.0, device=device, requires_grad=True)
             return {"logits": dummy_logits, "loss": dummy_loss}
 
@@ -492,12 +499,11 @@ def main():
     # Move model to GPU with memory monitoring
     try:
         model = model.to(device)
-        if torch.cuda.is_available():
-            model = model.half()  # Use half precision
-            
-            memory_allocated = torch.cuda.memory_allocated() / 1024**3
-            memory_cached = torch.cuda.memory_reserved() / 1024**3
-            logger.info(f"🔍 GPU Memory after model load - Allocated: {memory_allocated:.2f}GB, Cached: {memory_cached:.2f}GB")
+        # Keep model in float32 to avoid precision issues
+        
+        memory_allocated = torch.cuda.memory_allocated() / 1024**3
+        memory_cached = torch.cuda.memory_reserved() / 1024**3
+        logger.info(f"🔍 GPU Memory after model load - Allocated: {memory_allocated:.2f}GB, Cached: {memory_cached:.2f}GB")
             
     except RuntimeError as e:
         if "out of memory" in str(e):
@@ -606,11 +612,9 @@ def main():
                 # Move to device
                 batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
                 
-                # Convert to half precision
-                if torch.cuda.is_available():
-                    for k in ['image']:
-                        if k in batch and torch.is_tensor(batch[k]):
-                            batch[k] = batch[k].half()
+                # Ensure consistent data types (keep float32)
+                if 'labels' in batch and torch.is_tensor(batch['labels']):
+                    batch['labels'] = batch['labels'].long()
                 
                 # Forward pass
                 outputs = model(
@@ -685,11 +689,9 @@ def main():
                     torch.cuda.empty_cache()
                     batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
                     
-                    # Convert to half precision
-                    if torch.cuda.is_available():
-                        for k in ['image']:
-                            if k in batch and torch.is_tensor(batch[k]):
-                                batch[k] = batch[k].half()
+                    # Ensure consistent data types (keep float32)
+                    if 'labels' in batch and torch.is_tensor(batch['labels']):
+                        batch['labels'] = batch['labels'].long()
                     
                     outputs = model(
                         image=batch["image"],
